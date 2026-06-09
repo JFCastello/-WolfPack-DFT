@@ -132,6 +132,12 @@ ask() {  # ask VARNAME "prompt" "default"
     printf -v "$__var" '%s' "${__ans:-$__def}"
 }
 
+ask_yn() {  # ask_yn "question" -> 0 if yes
+    [[ $INTERACTIVE -eq 0 ]] && return 1
+    local __r; read -r -p "    $1 [y/N] " __r || return 1
+    [[ "$__r" =~ ^[Yy] ]]
+}
+
 # Make `module`/`ml` callable inside this non-login shell if possible.
 if ! type module >/dev/null 2>&1 && ! type ml >/dev/null 2>&1; then
     for f in /etc/profile.d/lmod.sh /etc/profile.d/modules.sh \
@@ -194,20 +200,47 @@ diagnose_modules() {
     printf '%s\n' "$err" | grep -iE 'error|cannot be loaded|conflict|not found' | head -6
 }
 
+# Echo the FULL explicit module list that loading $1 brings in (its
+# dependencies included), so the job never relies on Lmod auto-loading OR on
+# default/sticky modules being present in a clean batch shell. We take every
+# versioned module (name/version) in $LOADEDMODULES after `purge + load $1` --
+# this captures the compiler (e.g. aocc/4.2.0) and MPI even when they survive
+# `purge` on the login node but would be ABSENT in the compute-node batch shell.
+expand_modules() {
+    local mods="$1"
+    have_modules || { echo "$mods"; return 0; }
+    ( run_module purge >/dev/null 2>&1 || true
+      # shellcheck disable=SC2086
+      if [[ "${WP_MODULE_CMD:-ml}" == "module" ]]; then module load $mods >/dev/null 2>&1 || true
+      else ml $mods >/dev/null 2>&1 || true; fi
+      local out="" m OIFS="$IFS"; IFS=':'
+      for m in ${LOADEDMODULES:-}; do
+          [[ -z "$m" ]] && continue
+          [[ "$m" == */* ]] || continue               # keep only name/version modules
+          out+="${out:+ }$m"
+      done
+      IFS="$OIFS"
+      [[ -n "$out" ]] && echo "$out" || echo "$mods" )
+}
+
 # Find a module set that actually exposes the VASP executable: try the bare
 # module, then each 'module spider' alternative, and return the first that
-# verifies. Echoes the working set; return 0 if verified, 1 if none verified,
-# 2 if it could not be tested on this node.
+# verifies -- EXPANDED to its full explicit dependency chain. Echoes the working
+# set; return 0 if verified, 1 if none verified, 2 if it cannot be tested here.
+_emit_working() {  # echo the explicit dep chain for a verified set (fallback: raw)
+    local exp; exp="$(expand_modules "$1")"
+    [[ -n "$exp" ]] && echo "$exp" || echo "$1"
+}
 resolve_working_modules() {
     local vasp="$1" exe="${WP_VASP_STD:-vasp_std}" line pre
     if ! have_modules; then
         pre="$(detect_prereqs_all "$vasp" | head -1)"
         echo "${pre:+$pre }$vasp"; return 2
     fi
-    if verify_modules "$vasp" "$exe"; then echo "$vasp"; return 0; fi
+    if verify_modules "$vasp" "$exe"; then _emit_working "$vasp"; return 0; fi
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        if verify_modules "$line $vasp" "$exe"; then echo "$line $vasp"; return 0; fi
+        if verify_modules "$line $vasp" "$exe"; then _emit_working "$line $vasp"; return 0; fi
     done < <(detect_prereqs_all "$vasp")
     pre="$(detect_prereqs_all "$vasp" | head -1)"
     echo "${pre:+$pre }$vasp"; return 1
@@ -229,24 +262,69 @@ detect_max_cores() {
 # This is the quickest way to diagnose a "vasp_std: No such file or directory"
 # job failure (run it on a login/compute node that has the module system).
 # --------------------------------------------------------------------------- #
+update_conf_key() {  # update_conf_key KEY VALUE FILE
+    if grep -q "^$1=" "$3" 2>/dev/null; then
+        sed -i "s#^$1=.*#$1=\"$2\"#" "$3"
+    else
+        printf '%s="%s"\n' "$1" "$2" >> "$3"
+    fi
+}
+
 if [[ $VERIFY_ONLY -eq 1 ]]; then
     [[ -f "$CONF" ]] && source "$CONF" \
         || { warn "no profile at $CONF — run 'vasp-configure' first."; exit 1; }
     exe="${WP_VASP_STD:-vasp_std}"
     info "Verifying VASP modules from $CONF"
-    echo "    modules : ${WP_VASP_MODULES:-(none)}  [${WP_MODULE_CMD:-ml}]"
+
+    # Repair a mistyped module command (e.g. a compiler 'aocc/4.2.0' sitting in
+    # WP_MODULE_CMD): fold it back into the module list and use 'ml'.
+    repaired=""
+    case "${WP_MODULE_CMD,,}" in
+        ml|module) WP_MODULE_CMD="${WP_MODULE_CMD,,}" ;;
+        *) warn "WP_MODULE_CMD='$WP_MODULE_CMD' is not 'ml' or 'module' (a slip)."
+           if [[ "$WP_MODULE_CMD" == */* || "$WP_MODULE_CMD" == *[0-9]* ]]; then
+               note "treating it as a module and adding it to the load list."
+               WP_VASP_MODULES="$WP_MODULE_CMD${WP_VASP_MODULES:+ $WP_VASP_MODULES}"
+           fi
+           WP_MODULE_CMD="ml"; repaired=1 ;;
+    esac
+    echo "    modules : ${WP_VASP_MODULES:-(none)}  [${WP_MODULE_CMD}]"
     echo "    exe     : $exe"
-    if [[ -z "${WP_VASP_MODULES:-}" ]]; then
-        warn "no modules configured (WP_VASP_MODULES empty)."; exit 1
-    fi
+    [[ -z "${WP_VASP_MODULES:-}" ]] && { warn "no modules configured."; exit 1; }
     if ! have_modules; then
         warn "no Lmod/Environment-Modules on THIS machine — run --verify on a"
         warn "login/compute node of the cluster."; exit 2
     fi
+
     if verify_modules "$WP_VASP_MODULES" "$exe"; then
         info "${c_grn}OK${c_rst}: '$exe' is available after loading your modules."
+        # Bake the FULL explicit dependency chain so a clean batch shell (which
+        # lacks the login node's default/sticky modules) loads everything too.
+        explicit="$(expand_modules "$WP_VASP_MODULES")"
+        recommend=""
+        if [[ -n "$explicit" && "$explicit" != "$WP_VASP_MODULES" ]]; then
+            warn "your modules pull in dependencies implicitly:"
+            echo "        configured : $WP_VASP_MODULES"
+            echo "        full set   : $explicit"
+            warn "a clean batch job may NOT have those deps -> use the explicit set."
+            recommend="$explicit"
+        fi
+        if [[ -n "$repaired" || -n "$recommend" ]]; then
+            new_mods="${recommend:-$WP_VASP_MODULES}"
+            echo
+            if [[ $INTERACTIVE -eq 1 ]] && ask_yn "Write the corrected/explicit modules to $CONF now?"; then
+                update_conf_key WP_VASP_MODULES "$new_mods" "$CONF"
+                update_conf_key WP_MODULE_CMD   "$WP_MODULE_CMD" "$CONF"
+                info "Updated $CONF -> WP_VASP_MODULES=\"$new_mods\""
+            else
+                echo "    To apply, run: vasp-configure --edit   and set"
+                echo "      WP_VASP_MODULES=\"$new_mods\""
+                echo "      WP_MODULE_CMD=\"$WP_MODULE_CMD\""
+            fi
+        fi
         exit 0
     fi
+
     warn "FAILED: after loading your modules, '$exe' is NOT on PATH."
     warn "This is exactly what makes SLURM jobs die with"
     warn "  'execve(): $exe: No such file or directory'."
@@ -313,6 +391,20 @@ else
 fi
 ask WP_VASP_MODULES "Module(s) to load for VASP (space-separated)" "$WP_VASP_MODULES"
 ask WP_MODULE_CMD   "Module command (ml | module)" "$WP_MODULE_CMD"
+# WP_MODULE_CMD must be the loader command, not a module. If someone typed a
+# module spec here (e.g. a compiler like 'aocc/4.2.0'), fold it into the module
+# list and fall back to 'ml' -- this is a common slip and would otherwise put
+# the wrong token in the load command.
+case "${WP_MODULE_CMD,,}" in
+    ml|module) WP_MODULE_CMD="${WP_MODULE_CMD,,}" ;;
+    *)
+        warn "'$WP_MODULE_CMD' is not a module command (expected 'ml' or 'module')."
+        if [[ "$WP_MODULE_CMD" == */* || "$WP_MODULE_CMD" == *[0-9]* ]]; then
+            note "treating '$WP_MODULE_CMD' as a module and adding it to the load list."
+            WP_VASP_MODULES="$WP_MODULE_CMD${WP_VASP_MODULES:+ $WP_VASP_MODULES}"
+        fi
+        WP_MODULE_CMD="ml" ;;
+esac
 ask WP_MODULE_PURGE "Run 'module purge' before loading? (1/0)" "$WP_MODULE_PURGE"
 ask WP_VASP_STD     "VASP std executable name" "$WP_VASP_STD"
 
