@@ -1,0 +1,100 @@
+# ============================================================================
+# WolfPack-DFT — .gitignore
+# Tracked: the scripts (*.sh, *.py), the wolfpack_plot/ package, and the docs
+# (*.md). Everything below is local, generated, or environment-specific.
+# ============================================================================
+
+# --- Python bytecode / caches ----------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- Packaging / build artifacts -------------------------------------------
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+
+# --- Virtual environments --------------------------------------------------
+.venv/
+venv/
+env/
+.conda/
+
+# --- Editor / OS cruft -----------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Backups / scratch -----------------------------------------------------
+*.bak
+*.orig
+*.tmp
+Readme.md.bak
+
+# ============================================================================
+# VASP run data & tool output — these are produced INSIDE calculation folders
+# (and by the test scripts). Ignored so a calc dropped in the repo for testing
+# is never committed. If you ever add small example/test data on purpose,
+# force-add it:  git add -f path/to/fixture
+# ============================================================================
+
+# --- VASP input/output files -----------------------------------------------
+WAVECAR
+CHGCAR
+CHG
+CONTCAR
+DOSCAR
+EIGENVAL
+IBZKPT
+OSZICAR
+OUTCAR
+PCDAT
+PROCAR
+PROOUT
+REPORT
+vasprun.xml
+vaspout.h5
+XDATCAR
+WAVEDER
+LOCPOT
+ELFCAR
+TMPCAR
+HILLSPOT
+PENALTYPOT
+*.tmp
+dryrun_OUTCAR
+
+# --- SLURM / job logs ------------------------------------------------------
+slurm-*.out
+*.out
+*.err
+vasp_dryrun_*.out
+vasp_dryrun_*.err
+vasp_test-*.out
+vasp_test-*.err
+
+# --- Toolkit-generated outputs ---------------------------------------------
+Plots/
+*.fig.pkl
+*analysis_report.txt
+# isolated benchmark run dirs created by vasp-test:
+vasp_test_*/
+# occupations table written by collect-u-data:
+U_data.dat
+
+# --- Stray figure/data files in the repo root ------------------------------
+/*.png
+/*.pdf
+/*.svg
+/*.csv
