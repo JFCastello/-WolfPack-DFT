@@ -134,13 +134,16 @@ Two paths to a tuned INCAR + SLURM script. Both end in `vasp-recommend-slurm`:
 
 ### Step 1: `vasp-dry-run`
 
-Submits a 1-rank VASP job with `--dry-run` to your **debug** partition (name,
-modules and email from your `vasp-configure` profile). VASP writes a memory
-table to the OUTCAR without running any actual SCF steps.
+Runs a 1-rank VASP `--dry-run` on your **debug** partition (name, modules and
+email from your `vasp-configure` profile) to write a memory table to the OUTCAR
+without doing any SCF steps. It first **renders a self-contained `slurm_dryrun.sh`**
+(resolved `#SBATCH` lines + module loads + the `srun` baked in) into the current
+directory, then submits *that* — so the exact job is on disk for inspection even
+if it fails.
 
 ```bash
 # from a directory with valid INCAR, POSCAR, POTCAR, KPOINTS:
-vasp-dry-run                  # self-submits to your debug partition (~30 s)
+vasp-dry-run                  # writes ./slurm_dryrun.sh and submits it (~30 s)
 ```
 
 ### Step 2: `vasp-recommend-slurm`
@@ -177,8 +180,13 @@ instead of predicting it. Submit it from a calculation directory:
 
 ```bash
 # from a directory with valid INCAR, POSCAR, POTCAR, KPOINTS:
-vasp-test                      # self-submits an ~11-min benchmark, then advises
+vasp-test                      # renders ./slurm_vasptest.sh, submits it, advises
 ```
+
+Like `vasp-dry-run`, it first writes a self-contained **`slurm_vasptest.sh`**
+(resolved `#SBATCH` + module loads) and submits that, so the *benchmark* job
+that ran is on disk too — separate from the **`slurm_job.sh`** it writes at the
+end (the recommended *production* job).
 
 What it does, all in one SLURM job on **one debug node (48 cores, 360 GB)**:
 

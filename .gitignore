@@ -96,6 +96,9 @@ U_data.dat
 slurm_job.sh
 slurm_job_*.sh
 INCAR.parallel
+# self-contained job scripts rendered (and submitted) by vasp-dry-run / vasp-test:
+slurm_dryrun.sh
+slurm_vasptest.sh
 
 # --- Stray figure/data files in the repo root ------------------------------
 /*.png
