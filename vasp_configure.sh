@@ -27,6 +27,7 @@
 #   vasp-configure --email me@uni.edu --main-partition compute \
 #                  --debug-partition debug --vasp-modules "gcc/13 vasp/6.4.3"
 #   vasp-configure --show                # print the current profile and exit
+#   vasp-configure --verify              # load the modules and check vasp_std
 #   vasp-configure --help
 #
 # FLAGS (all optional; any provided value pre-fills the wizard / is used as-is
@@ -35,13 +36,16 @@
 #   --vasp-modules "STR"   --main-partition NAME    --debug-partition NAME
 #   --main-cpus N          --debug-cpus N
 #   --main-mem MB          --debug-mem MB           --max-cores N
-#   --conf PATH            --non-interactive | -y    --show    --edit
+#   --conf PATH            --non-interactive | -y    --show    --edit    --verify
 #
-# FIX A BROKEN VASP/MODULE CHOICE
-#   If a job later fails because the chosen module is wrong or missing, just
-#   re-point the toolkit at a working one — no reinstall needed:
+# FIX A BROKEN VASP/MODULE CHOICE  (e.g. a job died with
+#   "execve(): vasp_std: No such file or directory")
+#   That means the configured module line does not put vasp_std on PATH (a
+#   wrong/conflicting module). No reinstall needed — diagnose and re-point it:
+#       vasp-configure --verify # load the modules and report what's wrong
 #       vasp-configure          # re-run the wizard and pick another version
-#       vasp-configure --edit   # hand-edit the profile (e.g. the module line)
+#                               #   (it now TEST-LOADS each choice automatically)
+#       vasp-configure --edit   # hand-edit the WP_VASP_MODULES line
 #       vasp-configure --show   # inspect the current profile
 ###############################################################################
 set -uo pipefail
@@ -50,12 +54,13 @@ CONF="${WOLFPACK_CLUSTER_CONF:-$HOME/.config/wolfpack-dft/cluster.conf}"
 INTERACTIVE=1
 SHOW_ONLY=0
 EDIT_ONLY=0
+VERIFY_ONLY=0
 
 c_bold=$'\033[1m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_cya=$'\033[36m'; c_rst=$'\033[0m'
 info() { printf '%s\n' "${c_bold}==>${c_rst} $*"; }
 note() { printf '%s\n' "    ${c_cya}$*${c_rst}"; }
 warn() { printf '%s\n' "    ${c_yel}WARN${c_rst} $*" >&2; }
-usage(){ sed -n '2,45p' "${BASH_SOURCE[0]}" | grep -v '^#####' | sed 's/^# \{0,1\}//'; exit 0; }
+usage(){ sed -n '2,49p' "${BASH_SOURCE[0]}" | grep -v '^#####' | sed 's/^# \{0,1\}//'; exit 0; }
 
 # --------------------------------------------------------------------------- #
 # Profile variables (pre-seeded by flags / detection / prompts)
@@ -87,6 +92,7 @@ while [[ $# -gt 0 ]]; do
         -y|--non-interactive) INTERACTIVE=0; shift ;;
         --show)             SHOW_ONLY=1; shift ;;
         --edit)             EDIT_ONLY=1; shift ;;
+        --verify)           VERIFY_ONLY=1; shift ;;
         -h|--help)          usage ;;
         *) warn "Unknown option: $1"; echo "Try: vasp-configure --help" >&2; exit 2 ;;
     esac
@@ -150,11 +156,61 @@ detect_vasp_modules() {
       | awk '{$1=$1; print}' | sort -u
 }
 
-detect_prereqs() {  # parse Lmod 'module spider' prerequisite block for $1
+detect_prereqs_all() {  # ALL alternative prerequisite lines from 'module spider'
+    # Lmod prints "You will need to load all module(s) on any one of the lines
+    # below" followed by several indented lines -- each line is ONE valid combo.
     local out; out="$(run_module spider "$1" 2>&1)" || return 0
     printf '%s\n' "$out" | awk '
         /You will need to load all module/ {grab=1; next}
-        grab && NF { sub(/^[[:space:]]+/,""); gsub(/[[:space:]]+/," "); print; exit }'
+        grab!=1 {next}
+        NF==0 { if (started) exit; next }
+        /^[[:space:]]/ { started=1; sub(/^[[:space:]]+/,""); gsub(/[[:space:]]+/," "); print; next }
+        { if (started) exit }'
+}
+
+# Load $1 (a module list) in a throwaway subshell and report whether the
+# executable $2 (default vasp_std) ends up on PATH. 0=works, 1=fails, 2=cannot
+# test (no module system / empty list). The parent shell is NOT modified.
+verify_modules() {
+    local mods="$1" exe="${2:-vasp_std}"
+    [[ -z "$mods" ]] && return 2
+    have_modules || return 2
+    ( run_module purge >/dev/null 2>&1 || true
+      # word-splitting of $mods is intentional
+      # shellcheck disable=SC2086
+      if [[ "${WP_MODULE_CMD:-ml}" == "module" ]]; then module load $mods >/dev/null 2>&1 || true
+      else ml $mods >/dev/null 2>&1 || true; fi
+      command -v "$exe" >/dev/null 2>&1 )
+}
+
+# Echo the Lmod error lines produced when loading $1 (for diagnostics).
+diagnose_modules() {
+    local mods="$1" err
+    # shellcheck disable=SC2086
+    err=$( { run_module purge
+             if [[ "${WP_MODULE_CMD:-ml}" == "module" ]]; then module load $mods
+             else ml $mods; fi
+           } 2>&1 1>/dev/null )
+    printf '%s\n' "$err" | grep -iE 'error|cannot be loaded|conflict|not found' | head -6
+}
+
+# Find a module set that actually exposes the VASP executable: try the bare
+# module, then each 'module spider' alternative, and return the first that
+# verifies. Echoes the working set; return 0 if verified, 1 if none verified,
+# 2 if it could not be tested on this node.
+resolve_working_modules() {
+    local vasp="$1" exe="${WP_VASP_STD:-vasp_std}" line pre
+    if ! have_modules; then
+        pre="$(detect_prereqs_all "$vasp" | head -1)"
+        echo "${pre:+$pre }$vasp"; return 2
+    fi
+    if verify_modules "$vasp" "$exe"; then echo "$vasp"; return 0; fi
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        if verify_modules "$line $vasp" "$exe"; then echo "$line $vasp"; return 0; fi
+    done < <(detect_prereqs_all "$vasp")
+    pre="$(detect_prereqs_all "$vasp" | head -1)"
+    echo "${pre:+$pre }$vasp"; return 1
 }
 
 sinfo_partitions() { command -v sinfo >/dev/null 2>&1 && sinfo -h -o "%P" 2>/dev/null; }
@@ -167,6 +223,41 @@ detect_max_cores() {
     sacctmgr -nP show assoc user="$USER" format=GrpTRES,MaxTRES 2>/dev/null \
       | tr '|,' '\n\n' | grep -iE '^cpu=' | grep -oE '[0-9]+' | sort -n | tail -1
 }
+
+# --------------------------------------------------------------------------- #
+# --verify: load the configured modules and check the VASP executable appears.
+# This is the quickest way to diagnose a "vasp_std: No such file or directory"
+# job failure (run it on a login/compute node that has the module system).
+# --------------------------------------------------------------------------- #
+if [[ $VERIFY_ONLY -eq 1 ]]; then
+    [[ -f "$CONF" ]] && source "$CONF" \
+        || { warn "no profile at $CONF — run 'vasp-configure' first."; exit 1; }
+    exe="${WP_VASP_STD:-vasp_std}"
+    info "Verifying VASP modules from $CONF"
+    echo "    modules : ${WP_VASP_MODULES:-(none)}  [${WP_MODULE_CMD:-ml}]"
+    echo "    exe     : $exe"
+    if [[ -z "${WP_VASP_MODULES:-}" ]]; then
+        warn "no modules configured (WP_VASP_MODULES empty)."; exit 1
+    fi
+    if ! have_modules; then
+        warn "no Lmod/Environment-Modules on THIS machine — run --verify on a"
+        warn "login/compute node of the cluster."; exit 2
+    fi
+    if verify_modules "$WP_VASP_MODULES" "$exe"; then
+        info "${c_grn}OK${c_rst}: '$exe' is available after loading your modules."
+        exit 0
+    fi
+    warn "FAILED: after loading your modules, '$exe' is NOT on PATH."
+    warn "This is exactly what makes SLURM jobs die with"
+    warn "  'execve(): $exe: No such file or directory'."
+    echo "    Lmod said:"
+    diagnose_modules "$WP_VASP_MODULES" | sed 's/^/      /'
+    echo
+    echo "    Fix it with either:"
+    echo "      vasp-configure          # re-pick a VASP version (auto-verified)"
+    echo "      vasp-configure --edit   # correct the WP_VASP_MODULES line by hand"
+    exit 1
+fi
 
 # --------------------------------------------------------------------------- #
 # Wizard
@@ -203,9 +294,14 @@ if have_modules; then
             m|M) read -r -p "    Module spec(s) (space-separated): " WP_VASP_MODULES || true ;;
             *) if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick>=1 && pick<=${#VASP_CANDS[@]} )); then
                    chosen="${VASP_CANDS[pick-1]}"
-                   prereq="$(detect_prereqs "$chosen")"
-                   [[ -n "$prereq" ]] && note "prerequisites detected: $prereq"
-                   WP_VASP_MODULES="${prereq:+$prereq }$chosen"
+                   echo "    Testing which module set actually exposes ${WP_VASP_STD}"
+                   echo "    (loading candidates in a throwaway shell) ..."
+                   if WP_VASP_MODULES="$(resolve_working_modules "$chosen")"; then
+                       note "verified: '$WP_VASP_MODULES' makes ${WP_VASP_STD} available"
+                   else
+                       warn "no tested combination exposed ${WP_VASP_STD}; using a best"
+                       warn "guess below — confirm/fix it before submitting jobs."
+                   fi
                else warn "invalid choice; leaving module list empty."; fi ;;
         esac
     elif [[ ${#VASP_CANDS[@]} -eq 0 && -z "$WP_VASP_MODULES" ]]; then
@@ -219,6 +315,29 @@ ask WP_VASP_MODULES "Module(s) to load for VASP (space-separated)" "$WP_VASP_MOD
 ask WP_MODULE_CMD   "Module command (ml | module)" "$WP_MODULE_CMD"
 ask WP_MODULE_PURGE "Run 'module purge' before loading? (1/0)" "$WP_MODULE_PURGE"
 ask WP_VASP_STD     "VASP std executable name" "$WP_VASP_STD"
+
+# Final safety net: actually load the chosen modules and confirm the executable
+# shows up. This is what prevents the "vasp_std: No such file or directory"
+# job failure from a wrong/conflicting module line.
+if [[ -n "$WP_VASP_MODULES" ]] && have_modules; then
+    if verify_modules "$WP_VASP_MODULES" "$WP_VASP_STD"; then
+        note "module check OK: '${WP_VASP_STD}' is on PATH after loading."
+    else
+        warn "MODULE CHECK FAILED — after loading your modules, '${WP_VASP_STD}'"
+        warn "is NOT on PATH, so SLURM jobs would die with"
+        warn "  'execve(): ${WP_VASP_STD}: No such file or directory'."
+        diagnose_modules "$WP_VASP_MODULES" | sed 's/^/      Lmod: /'
+        if [[ $INTERACTIVE -eq 1 ]]; then
+            ask WP_VASP_MODULES "Re-enter a working module list (or keep to fix later)" \
+                "$WP_VASP_MODULES"
+            verify_modules "$WP_VASP_MODULES" "$WP_VASP_STD" \
+                && note "module check OK now." \
+                || warn "still failing — fix later with 'vasp-configure --verify'."
+        else
+            warn "Re-run 'vasp-configure' (interactive) or 'vasp-configure --edit'."
+        fi
+    fi
+fi
 echo
 
 # ---- 3. partitions ----

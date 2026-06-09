@@ -55,11 +55,21 @@ vasp-configure --show   # print the current profile
 vasp-configure --edit   # hand-edit the profile in $EDITOR
 ```
 
-> **A job failed because a module is wrong/missing?** You do **not** need to
-> reinstall. Just re-point the toolkit at a working VASP build:
-> `vasp-configure` (re-run the wizard and pick another version), or
-> `vasp-configure --edit` to fix the `WP_VASP_MODULES` line by hand. The next
-> `vasp-dry-run` / `vasp-test` / `vasp-recommend-slurm` uses the new modules.
+> **A job died with `execve(): vasp_std: No such file or directory`?** That
+> means the configured module line doesn't put `vasp_std` on `PATH` (a wrong or
+> conflicting module — e.g. an Lmod *"cannot be loaded as requested"* error
+> aborts the load, so VASP is never available). No reinstall needed:
+>
+> ```bash
+> vasp-configure --verify   # loads your modules and reports exactly what fails
+> vasp-configure            # re-pick a version — it now TEST-LOADS each choice
+> vasp-configure --edit     # or fix the WP_VASP_MODULES line by hand
+> ```
+>
+> The wizard now verifies every choice by actually loading it and checking that
+> `vasp_std` appears, and when `module spider` lists several prerequisite
+> combinations it tries each and keeps the first that works — so a conflicting
+> set (like three different `gcc` versions) is rejected automatically.
 
 It detects and lets you confirm/override:
 
