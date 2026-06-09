@@ -151,15 +151,6 @@ detect_vasp_modules() {
       | awk '{$1=$1; print}' | sort -u
 }
 
-# Suggest the prerequisite line (compiler/MPI) for a module from 'module spider'
-# -- just the first "you will need to load" line, not the whole dependency tree.
-detect_prereqs() {
-    local out; out="$(run_module spider "$1" 2>&1)" || return 0
-    printf '%s\n' "$out" | awk '
-        /You will need to load all module/ {grab=1; next}
-        grab && NF { sub(/^[[:space:]]+/,""); gsub(/[[:space:]]+/," "); print; exit }'
-}
-
 sinfo_partitions() { command -v sinfo >/dev/null 2>&1 && sinfo -h -o "%P" 2>/dev/null; }
 default_partition() { sinfo_partitions | tr ' ' '\n' | grep '\*' | tr -d '* ' | head -1; }
 guess_debug_part()  { sinfo_partitions | tr ' *' '\n\n' | grep -iE 'debug|devel|test|short' | head -1; }
@@ -238,48 +229,44 @@ ask WP_EMAIL "Email (blank = no mail line)" "$WP_EMAIL"
 echo
 
 # ---- 2. VASP modules ----
+# You pick a VASP module; if your cluster needs a compiler/MPI loaded first,
+# you give it SEPARATELY and it is prepended (never replaces the VASP module).
 info "VASP modules to load"
-if have_modules && [[ $INTERACTIVE -eq 1 && -z "$WP_VASP_MODULES" ]]; then
+if [[ -z "$WP_VASP_MODULES" && $INTERACTIVE -eq 1 ]] && have_modules; then
     note "module command: $WP_MODULE_CMD"
     mapfile -t VASP_CANDS < <(detect_vasp_modules)
-    chosen=""
     if [[ ${#VASP_CANDS[@]} -gt 0 ]]; then
         echo "    Detected VASP modules:"
         i=1; for c in "${VASP_CANDS[@]}"; do printf "      %2d) %s\n" "$i" "$c"; i=$((i+1)); done
-        echo "       m) type the module(s) manually"
+        echo "       m) type the whole module line manually"
         echo "       s) skip (no module)"
         read -r -p "    Choose [1]: " pick || true; pick="${pick:-1}"
         case "$pick" in
-            s|S) chosen="" ;;
-            m|M) read -r -p "    Modules to load (space-separated): " WP_VASP_MODULES || true; chosen="" ;;
+            s|S) WP_VASP_MODULES="" ;;
+            m|M) ask WP_VASP_MODULES "Whole module line to load (space-separated)" "" ;;
             *)   if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick>=1 && pick<=${#VASP_CANDS[@]} )); then
                      chosen="${VASP_CANDS[pick-1]}"
-                 else warn "invalid choice."; fi ;;
+                     note "Many clusters require a compiler/MPI to be loaded BEFORE the VASP"
+                     note "module (e.g. aocc/4.2.0, gcc/13, intel/2024). If yours does, enter"
+                     note "it here -- it is loaded first, then $chosen. Leave blank if none."
+                     ask PREREQ "Module(s) to load before $chosen (blank if none)" ""
+                     WP_VASP_MODULES="${PREREQ:+$PREREQ }$chosen"
+                     note "module line -> $WP_VASP_MODULES"
+                 else
+                     warn "invalid choice; type the module line below."
+                     ask WP_VASP_MODULES "Whole module line to load (space-separated)" ""
+                 fi ;;
         esac
-        if [[ -n "$chosen" ]]; then
-            # Pre-fill a SHORT, sensible default: the compiler/MPI prerequisite
-            # that 'module spider' reports, plus the chosen module. You can edit
-            # this freely on the next line (e.g. add a compiler like aocc/4.2.0).
-            prereq="$(detect_prereqs "$chosen")"
-            if [[ -n "$prereq" ]]; then
-                note "module spider suggests loading first:  $prereq"
-                WP_VASP_MODULES="$prereq $chosen"
-            else
-                WP_VASP_MODULES="$chosen"
-            fi
-        fi
     else
         warn "no VASP module detected via 'module avail/spider' — type it below."
+        ask WP_VASP_MODULES "Whole module line to load for VASP (space-separated)" ""
     fi
-elif ! have_modules; then
-    warn "no Lmod/Environment-Modules on this machine. If your cluster loads VASP"
-    warn "another way, type the module spec(s) below (or leave blank to skip)."
+elif [[ -z "$WP_VASP_MODULES" && $INTERACTIVE -eq 1 ]]; then
+    warn "no Lmod/Environment-Modules here. If your cluster loads VASP another way,"
+    warn "type the module line below (or leave blank to skip)."
+    ask WP_VASP_MODULES "Whole module line to load for VASP (space-separated)" ""
 fi
-
-# THE single place you define the module line. Edit it freely -- add the
-# compiler/MPI (e.g. 'aocc/4.2.0 vasp/6.5.0-mpi-zen4-h') if VASP needs them.
-ask WP_VASP_MODULES "Modules to load for VASP (space-separated; add compiler/MPI if needed)" "$WP_VASP_MODULES"
-ask WP_VASP_STD     "VASP std executable name" "$WP_VASP_STD"
+ask WP_VASP_STD "VASP std executable name" "$WP_VASP_STD"
 
 # Informational check -- never blocks, never loops.
 if [[ -n "$WP_VASP_MODULES" ]] && have_modules; then
@@ -288,8 +275,8 @@ if [[ -n "$WP_VASP_MODULES" ]] && have_modules; then
     else
         warn "could NOT confirm '$WP_VASP_STD' loads from these modules:"
         diagnose_modules "$WP_VASP_MODULES" | sed 's/^/      Lmod: /'
-        warn "double-check the list (likely a missing compiler/MPI). You can"
-        warn "re-test any time with:  vasp-configure --verify"
+        warn "likely a missing compiler/MPI prerequisite. Re-run 'vasp-configure'"
+        warn "and enter it, or test/fix with: vasp-configure --verify / --edit"
     fi
 fi
 echo
