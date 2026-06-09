@@ -485,26 +485,38 @@ def main(argv=None):
     except (ValueError, FileNotFoundError, RuntimeError) as exc:
         sys.exit(f"ERROR: {exc}")
 
-    print(f"[4/4] Rendering figure (method={cfg.method}, {len(groups)} group(s), "
-          f"spin={cfg.spin}, {len(bands_data['segments'])} k-path panel(s)) ...")
-    fig, _axes = build_figure(bands_data, dos_data, groups, cfg, spins,
-                              show_both, gap=gap)
-
     out_dir = root / OUT_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
     name = cfg.name or DEFAULT_OUT_NAME
-    written = []
-    for fmt in [f.strip().lower() for f in cfg.formats.split(",") if f.strip()]:
-        path = out_dir / f"{name}.{fmt}"
-        fig.savefig(path, dpi=cfg.dpi, bbox_inches="tight")
-        written.append(path)
-    if cfg.pickle:
-        pk = out_dir / f"{name}.fig.pkl"
-        with open(pk, "wb") as fh:
-            pickle.dump(fig, fh)
-        written.append(pk)
+    formats = [f.strip().lower() for f in cfg.formats.split(",") if f.strip()]
     import matplotlib.pyplot as plt
-    plt.close(fig)
+
+    # The 'stacked' method overlays both spins poorly, so when both channels are
+    # requested we render ONE figure per spin and tag the spin in the filename.
+    if cfg.method == "stacked" and show_both:
+        jobs = [([Spin.up], "up", r"\uparrow"), ([Spin.down], "down", r"\downarrow")]
+    else:
+        jobs = [(spins, "", None)]
+
+    written = []
+    for job_spins, suffix, note in jobs:
+        base = f"{name}_{suffix}" if suffix else name
+        print(f"[4/4] Rendering figure (method={cfg.method}, {len(groups)} group(s), "
+              f"spin={suffix or cfg.spin}, "
+              f"{len(bands_data['segments'])} k-path panel(s)) -> {base} ...")
+        fig, _axes = build_figure(bands_data, dos_data, groups, cfg, job_spins,
+                                  False if suffix else show_both, gap=gap,
+                                  spin_note=note)
+        for fmt in formats:
+            path = out_dir / f"{base}.{fmt}"
+            fig.savefig(path, dpi=cfg.dpi, bbox_inches="tight")
+            written.append(path)
+        if cfg.pickle:
+            pk = out_dir / f"{base}.fig.pkl"
+            with open(pk, "wb") as fh:
+                pickle.dump(fig, fh)
+            written.append(pk)
+        plt.close(fig)
 
     try:
         rep = write_report(out_dir / f"{name}.analysis_report.txt", root, cfg,

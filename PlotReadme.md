@@ -189,11 +189,24 @@ The plotter detects ISPIN automatically:
 - **ISPIN = 1** (non spin-polarised): one channel. `--spin` is meaningless and
   is ignored (a single set of bands/DOS is drawn); passing `--spin up/down`
   prints a harmless note rather than an error.
-- **ISPIN = 2** (collinear spin): `--spin both` overlays both channels
-  (spin-up filled markers / solid DOS, spin-down open markers / mirrored DOS);
+- **ISPIN = 2** (collinear spin): `--spin both` overlays both channels;
   `--spin up` or `--spin down` isolates one.
 - **ISPIN ≥ 3** (non-collinear / spinor, 4 components): not implemented — the
   tool stops with a clear message instead of producing a wrong figure.
+
+**Both-spin marker styling.** When both channels are drawn together in
+`plain`, `one_orbital`, `duo` or `rgb`, circles are replaced by **very small
+triangles** so the channels never sit ambiguously on top of one another:
+spin-up = ▲ (up-triangle) with a **pure-cyan** edge, spin-down = ▼
+(down-triangle) with a **pure-magenta** edge. The face still carries the
+projection colour/opacity; the coloured edge marks the spin even where the
+weight (and thus the face) is faint. In `plain` mode the markers use an
+intermediate opacity so the dispersion stays readable.
+
+**Stacked + both spins → two figures.** `--method stacked` overlays poorly with
+two spin channels, so when `--spin both` it writes **one figure per spin**, with
+the channel in the filename: `<name>_up.{png,pdf}` and `<name>_down.{png,pdf}`
+(the title is tagged ↑ / ↓ too).
 
 ---
 

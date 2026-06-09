@@ -92,6 +92,10 @@ Plots/
 vasp_test_*/
 # occupations table written by collect-u-data:
 U_data.dat
+# SLURM script + INCAR snippet written by vasp-recommend-slurm / vasp-test:
+slurm_job.sh
+slurm_job_*.sh
+INCAR.parallel
 
 # --- Stray figure/data files in the repo root ------------------------------
 /*.png

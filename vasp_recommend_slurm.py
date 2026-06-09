@@ -422,13 +422,13 @@ class Candidate:
 
     def _incar_snippet_dft(self) -> str:
         return (
-            "# --- Parallelization (VASP wiki recipe; pure MPI on NLHPC) ---\n"
+            "# --- Parallelization (VASP wiki recipe; pure MPI) ---\n"
             f"KPAR   = {self.kpar}\n"
             f"NCORE  = {self.ncore}\n"
             f"NSIM   = {self.nsim}\n"
             f"LPLANE = {format_bool(self.lplane)}\n"
             f"# Derived only: NPAR = {self.npar}  (do NOT set BOTH NCORE and NPAR)\n"
-            "# I/O hygiene (NLHPC tip):\n"
+            "# I/O hygiene:\n"
             "LWAVE  = .FALSE.\n"
             "LCHARG = .FALSE.\n"
             "LVTOT  = .FALSE."
@@ -2639,6 +2639,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Number of top candidates to print (default 10).")
     parser.add_argument("--csv", type=Path, default=None,
                         help="Optional path: write the full ranked list as CSV.")
+    parser.add_argument("--write-slurm", type=Path, default=Path("slurm_job.sh"),
+                        metavar="FILE",
+                        help="Write the recommended SLURM script to this file "
+                             "(default: ./slurm_job.sh) so the exact job you "
+                             "submit is on disk for inspection. Use --no-write "
+                             "to only print it.")
+    parser.add_argument("--write-incar", type=Path, default=Path("INCAR.parallel"),
+                        metavar="FILE",
+                        help="Write the recommended INCAR parallelization "
+                             "snippet to this file (default: ./INCAR.parallel).")
+    parser.add_argument("--no-write", action="store_true",
+                        help="Do not write any files; only print to stdout.")
     parser.add_argument("--email", type=str, default=None,
                         help="Email injected into the SLURM script (default: "
                              "from the cluster profile written by "
@@ -2898,6 +2910,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.csv is not None:
         write_csv(args.csv, candidates)
         print(f"[CSV] Full ranked list written to {args.csv}")
+
+    # Write the recommended SLURM script + INCAR snippet to disk so the exact
+    # job you submit is recoverable if it later fails (see also vasp-test).
+    if not args.no_write:
+        script_text = slurm_script(
+            candidate=candidates[0],
+            partition_name=args.partition,
+            partition_info=partition_info,
+            summary=summary,
+            email=args.email or None,
+            job_name=args.job_name,
+            executable=executable,
+            time_limit=args.time,
+        )
+        try:
+            sp_path = Path(args.write_slurm)
+            sp_path.write_text(script_text + "\n")
+            try:
+                os.chmod(sp_path, 0o755)
+            except OSError:
+                pass
+            inc_path = Path(args.write_incar)
+            inc_path.write_text(
+                "# INCAR parallelization snippet (vasp-recommend-slurm)\n"
+                + candidates[0].incar_snippet + "\n")
+            print()
+            print(f"[FILES] SLURM script written to : {sp_path}"
+                  f"   (submit with: sbatch {sp_path})")
+            print(f"[FILES] INCAR snippet written to: {inc_path}"
+                  f"   (merge into your INCAR)")
+        except OSError as exc:
+            print(f"[FILES] WARNING: could not write output files: {exc}",
+                  file=sys.stderr)
 
     return 0
 

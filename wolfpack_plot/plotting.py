@@ -23,8 +23,10 @@ from pymatgen.electronic_structure.core import Spin
 from .config import (ALPHA_MAX, ALPHA_MIN, BACKBONE_COLOR, BACKBONE_LW,
                      DEFAULT_METHOD, DOS_LW, DOS_TOTAL_LW, DUO_CHANNELS,
                      EDGE_CORE, EDGE_HALO, KPT_LABEL_SIZE, MARKER_SIZE,
-                     MARKER_TARGET, ONE_ORBITAL_CHANNEL, PLAIN_MARKER_COLOR,
-                     PLAIN_MARKER_SIZE, PROJ_CUTOFF, RGB_CHANNELS, SEG_WSPACE,
+                     MARKER_TARGET, ONE_ORBITAL_CHANNEL, PLAIN_ALPHA,
+                     PLAIN_MARKER_COLOR, PLAIN_MARKER_SIZE, PROJ_CUTOFF,
+                     RGB_CHANNELS, SEG_WSPACE, SPIN_DOWN_EDGE, SPIN_DOWN_MARKER,
+                     SPIN_EDGE_LW, SPIN_UP_EDGE, SPIN_UP_MARKER,
                      STACKED_CIRCLE_SIZE, STACKED_COLORS, STACKED_INTERP,
                      STACKED_PROJ_CUTOFF, WIDTH_RATIOS)
 from .formatting import _auto_formula_tex, format_kpt_label, mathify_title
@@ -33,6 +35,18 @@ from .vaspio import _segment_ticks
 
 
 MARKER = "o"               # small circle: clearest when many bands overlap
+
+
+def _spin_marker(sp, show_both):
+    """Circle for a single channel; up/down triangle when both spins overlap."""
+    if not show_both:
+        return MARKER
+    return SPIN_UP_MARKER if sp == Spin.up else SPIN_DOWN_MARKER
+
+
+def _spin_edge(sp):
+    """Pure cyan outline for spin up, pure magenta for spin down."""
+    return SPIN_UP_EDGE if sp == Spin.up else SPIN_DOWN_EDGE
 
 
 # --------------------------------------------------------------------------- #
@@ -99,22 +113,25 @@ def _draw_segment(ax, bands_data, groups, band_w, w_tot, sl, spins, cfg, lsty,
 
 
 def _draw_plain(ax, bands_data, sl, spins, cfg, lsty, show_both):
-    """plain method: shared pale backbone + a small SOLID BLACK circle at every
-    k-point where the eigenvalues were computed. No projections."""
+    """plain method: shared pale backbone + a small black marker (intermediate
+    opacity) at every k-point where the eigenvalues were computed. One spin ->
+    circles; both spins -> up/down triangles with cyan/magenta edges."""
     _draw_backbone(ax, bands_data, sl, spins, lsty)
     x = bands_data["distance"][sl]
     size = float(getattr(cfg, "plain_marker_size", PLAIN_MARKER_SIZE))
+    face = mcolors.to_rgba(PLAIN_MARKER_COLOR, PLAIN_ALPHA)   # intermediate alpha
     for sp in spins:
-        filled = (not show_both) or (sp == Spin.up)
         Y = bands_data["bands"][sp][:, sl]               # (nb, nk_seg)
         X = np.tile(x, Y.shape[0])
         Yf = Y.reshape(-1)
-        if filled:
-            ax.scatter(X, Yf, s=size, marker=MARKER, facecolors=PLAIN_MARKER_COLOR,
+        marker = _spin_marker(sp, show_both)
+        if show_both:                                    # triangles + spin edge
+            ax.scatter(X, Yf, s=size, marker=marker, facecolors=[face],
+                       edgecolors=_spin_edge(sp), linewidths=SPIN_EDGE_LW,
+                       zorder=3 if sp == Spin.up else 4)
+        else:                                            # single channel: circle
+            ax.scatter(X, Yf, s=size, marker=marker, facecolors=[face],
                        edgecolors="none", linewidths=0.0, zorder=3)
-        else:                                            # spin-down: open circles
-            ax.scatter(X, Yf, s=size, marker=MARKER, facecolors="none",
-                       edgecolors=PLAIN_MARKER_COLOR, linewidths=0.4, zorder=4)
 
 
 def _draw_alpha_circles(ax, bands_data, groups, band_w, w_tot, sl, spins, cfg,
@@ -134,7 +151,6 @@ def _draw_alpha_circles(ax, bands_data, groups, band_w, w_tot, sl, spins, cfg,
     nb = {sp: bands_data["bands"][sp].shape[0] for sp in spins}
 
     for sp in spins:
-        filled = (not show_both) or (sp == Spin.up)
         wcols = [np.zeros((nb[sp], len(midx))) for _ in range(ng)]
         for g in groups:
             w = band_w[g["plain"]]
@@ -163,12 +179,14 @@ def _draw_alpha_circles(ax, bands_data, groups, band_w, w_tot, sl, spins, cfg,
         alpha = al_lo + (al_hi - al_lo) * S          # opacity = total weight
         rgba = np.concatenate([rgb, alpha[:, None]], axis=1)      # (M,4)
 
-        if filled:
-            ax.scatter(X, Y, s=size, marker=MARKER, facecolors=rgba,
+        marker = _spin_marker(sp, show_both)
+        if show_both:                                # triangles + cyan/magenta edge
+            ax.scatter(X, Y, s=size, marker=marker, facecolors=rgba,
+                       edgecolors=_spin_edge(sp), linewidths=SPIN_EDGE_LW,
+                       zorder=3 if sp == Spin.up else 4)
+        else:                                        # single channel: filled circle
+            ax.scatter(X, Y, s=size, marker=marker, facecolors=rgba,
                        edgecolors="none", linewidths=0.0, zorder=3)
-        else:                                        # spin-down: outline circles
-            ax.scatter(X, Y, s=size, marker=MARKER, facecolors="none",
-                       edgecolors=rgba, linewidths=0.4, zorder=4)
 
 
 def _draw_stacked(ax, bands_data, groups, band_w, w_tot, sl, spins, cfg, lsty):
@@ -289,8 +307,13 @@ def _apply_rcparams(font):
     })
 
 
-def build_figure(bands_data, dos_data, groups, cfg, spins, show_both, gap=None):
-    """Assemble the figure. Returns (fig, {'bands': [axes...], 'dos': axes})."""
+def build_figure(bands_data, dos_data, groups, cfg, spins, show_both, gap=None,
+                 spin_note=None):
+    """Assemble the figure. Returns (fig, {'bands': [axes...], 'dos': axes}).
+
+    `spin_note` (e.g. r"\\uparrow") is appended to the title -- used when the
+    stacked method is split into one figure per spin channel.
+    """
     ls_for = {Spin.up: "solid", Spin.down: (0, (4, 2))}
     method = getattr(cfg, "method", DEFAULT_METHOD)
 
@@ -418,15 +441,15 @@ def build_figure(bands_data, dos_data, groups, cfg, spins, show_both, gap=None):
                               label="k-points"))
     for g in groups:                                  # each group in its colour
         handles.append(group_handle(g["color"], g["label"]))
-    marker_methods = method not in ("stacked",)       # filled/open spin marks
-    if show_both and marker_methods:
+    marker_methods = method not in ("stacked",)       # spin marks (not stacked)
+    if show_both and marker_methods:                   # up/down triangles + edges
         handles += [
-            Line2D([0], [0], color="none", marker=legend_marker,
-                   markerfacecolor="0.3", markeredgecolor="none",
-                   markersize=8, label=r"spin $\uparrow$"),
-            Line2D([0], [0], color="none", marker=legend_marker,
-                   markerfacecolor="none", markeredgecolor="0.3",
-                   markersize=8, label=r"spin $\downarrow$"),
+            Line2D([0], [0], color="none", marker=SPIN_UP_MARKER,
+                   markerfacecolor="0.6", markeredgecolor=SPIN_UP_EDGE,
+                   markeredgewidth=1.0, markersize=8, label=r"spin $\uparrow$"),
+            Line2D([0], [0], color="none", marker=SPIN_DOWN_MARKER,
+                   markerfacecolor="0.6", markeredgecolor=SPIN_DOWN_EDGE,
+                   markeredgewidth=1.0, markersize=8, label=r"spin $\downarrow$"),
         ]
     elif bands_data["is_spin"] and marker_methods:
         arrow = r"\uparrow" if spins == [Spin.up] else r"\downarrow"
@@ -437,6 +460,10 @@ def build_figure(bands_data, dos_data, groups, cfg, spins, show_both, gap=None):
     if cfg.show_title:
         ttl = mathify_title(cfg.title) if cfg.title else \
             _auto_formula_tex(bands_data["structure"].composition.reduced_formula)
+        if spin_note:
+            ttl = f"{ttl}  $({spin_note})$"
         fig.suptitle(ttl, y=0.985, fontsize=14)
+    elif spin_note:
+        fig.suptitle(f"$({spin_note})$", y=0.985, fontsize=12)
 
     return fig, {"bands": band_axes, "dos": axd}

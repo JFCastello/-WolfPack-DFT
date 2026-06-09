@@ -52,7 +52,14 @@ looks. `install.sh` runs the wizard for you; re-run it any time:
 ```bash
 vasp-configure          # interactive wizard (detects + asks)
 vasp-configure --show   # print the current profile
+vasp-configure --edit   # hand-edit the profile in $EDITOR
 ```
+
+> **A job failed because a module is wrong/missing?** You do **not** need to
+> reinstall. Just re-point the toolkit at a working VASP build:
+> `vasp-configure` (re-run the wizard and pick another version), or
+> `vasp-configure --edit` to fix the `WP_VASP_MODULES` line by hand. The next
+> `vasp-dry-run` / `vasp-test` / `vasp-recommend-slurm` uses the new modules.
 
 It detects and lets you confirm/override:
 
@@ -139,20 +146,25 @@ vasp-dry-run                  # self-submits to your debug partition (~30 s)
 ### Step 2: `vasp-recommend-slurm`
 
 Reads the dry-run OUTCAR, enumerates (KPAR, NCORE, NPAR) candidates, ranks
-them by the VASP-wiki scoring rules and per-rank memory prediction, and
-prints a ready-to-submit SLURM script for the top candidate.
+them by the VASP-wiki scoring rules and per-rank memory prediction, prints the
+recommendation, and **writes it to disk** so the exact job you submit is always
+recoverable: `slurm_job.sh` (the SLURM script) and `INCAR.parallel` (the
+KPAR/NCORE/NSIM snippet) in the current directory.
 
 ```bash
-vasp-recommend-slurm dryrun_OUTCAR
-vasp-recommend-slurm dryrun_OUTCAR --partition main --email me@server.cl
-vasp-recommend-slurm dryrun_OUTCAR --max-cores 256 --top 5
-vasp-recommend-slurm --help          # full flag list
+vasp-recommend-slurm dryrun_OUTCAR          # -> ./slurm_job.sh + ./INCAR.parallel
+sbatch slurm_job.sh                         # submit the recommended job
+vasp-recommend-slurm dryrun_OUTCAR --partition main --max-cores 256 --top 5
+vasp-recommend-slurm dryrun_OUTCAR --no-write   # only print, write nothing
+vasp-recommend-slurm --help                 # full flag list
 ```
 
 **Useful flags:**
 - `--partition {main,debug,general,largemem}` — default `main`
 - `--max-cores N` / `--min-cores N` — rank-count search range
 - `--mem-headroom F` — safety multiplier (default 1.15)
+- `--write-slurm FILE` / `--write-incar FILE` — output paths (default
+  `slurm_job.sh` / `INCAR.parallel`); `--no-write` to disable
 - `--calc-type {auto,dft,gw,gw-low,rpa-low}` — override auto-detection
 - `--gw-ref-encutgw EV` — anchor for GW memory scaling
 
@@ -179,9 +191,11 @@ What it does, all in one SLURM job on **one debug node (48 cores, 360 GB)**:
    (correction factor → `--mem-headroom`), so the production memory ask matches
    what the job really used.
 4. Prints, ready to copy-paste, an **INCAR snippet** (`KPAR` / `NCORE` / `NSIM`)
-   and a **`main`-partition SLURM script** tuned for this exact job.
+   and a **`main`-partition SLURM script** tuned for this exact job, and **writes
+   them to your submit directory** as `slurm_job.sh` and `INCAR.parallel`
+   (so the exact production job is on disk — just `sbatch slurm_job.sh`).
 
-The report and copy-paste blocks land in the job's `vasp_test-<jobid>.out`.
+The report and copy-paste blocks also land in the job's `vasp_test-<jobid>.out`.
 
 **Tunables** (export before `sbatch`, or pass with `--export`):
 

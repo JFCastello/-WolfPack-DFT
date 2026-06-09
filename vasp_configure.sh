@@ -35,19 +35,27 @@
 #   --vasp-modules "STR"   --main-partition NAME    --debug-partition NAME
 #   --main-cpus N          --debug-cpus N
 #   --main-mem MB          --debug-mem MB           --max-cores N
-#   --conf PATH            --non-interactive | -y    --show
+#   --conf PATH            --non-interactive | -y    --show    --edit
+#
+# FIX A BROKEN VASP/MODULE CHOICE
+#   If a job later fails because the chosen module is wrong or missing, just
+#   re-point the toolkit at a working one — no reinstall needed:
+#       vasp-configure          # re-run the wizard and pick another version
+#       vasp-configure --edit   # hand-edit the profile (e.g. the module line)
+#       vasp-configure --show   # inspect the current profile
 ###############################################################################
 set -uo pipefail
 
 CONF="${WOLFPACK_CLUSTER_CONF:-$HOME/.config/wolfpack-dft/cluster.conf}"
 INTERACTIVE=1
 SHOW_ONLY=0
+EDIT_ONLY=0
 
 c_bold=$'\033[1m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_cya=$'\033[36m'; c_rst=$'\033[0m'
 info() { printf '%s\n' "${c_bold}==>${c_rst} $*"; }
 note() { printf '%s\n' "    ${c_cya}$*${c_rst}"; }
 warn() { printf '%s\n' "    ${c_yel}WARN${c_rst} $*" >&2; }
-usage(){ sed -n '2,49p' "${BASH_SOURCE[0]}" | grep -v '^#####' | sed 's/^# \{0,1\}//'; exit 0; }
+usage(){ sed -n '2,45p' "${BASH_SOURCE[0]}" | grep -v '^#####' | sed 's/^# \{0,1\}//'; exit 0; }
 
 # --------------------------------------------------------------------------- #
 # Profile variables (pre-seeded by flags / detection / prompts)
@@ -78,6 +86,7 @@ while [[ $# -gt 0 ]]; do
         --conf)             CONF="${2:?}"; shift 2 ;;
         -y|--non-interactive) INTERACTIVE=0; shift ;;
         --show)             SHOW_ONLY=1; shift ;;
+        --edit)             EDIT_ONLY=1; shift ;;
         -h|--help)          usage ;;
         *) warn "Unknown option: $1"; echo "Try: vasp-configure --help" >&2; exit 2 ;;
     esac
@@ -86,6 +95,23 @@ done
 if [[ $SHOW_ONLY -eq 1 ]]; then
     if [[ -f "$CONF" ]]; then info "Cluster profile: $CONF"; cat "$CONF"; else
         warn "No profile at $CONF. Run 'vasp-configure' to create one."; exit 1; fi
+    exit 0
+fi
+
+if [[ $EDIT_ONLY -eq 1 ]]; then
+    # Quick way to fix a wrong/missing module line (or any value) by hand.
+    if [[ ! -f "$CONF" ]]; then
+        printf '%s\n' "==> No profile yet — generating defaults to edit ($CONF)"
+        "$0" --non-interactive --conf "$CONF" >/dev/null 2>&1 || true
+    fi
+    editor="${VISUAL:-${EDITOR:-}}"
+    [[ -z "$editor" ]] && editor="$(command -v nano || command -v vim \
+        || command -v vi || echo vi)"
+    printf '%s\n' "==> Opening $CONF in '$editor' (edit, e.g., WP_VASP_MODULES) ..."
+    "$editor" "$CONF"
+    if [[ -f "$CONF" ]]; then
+        printf '%s\n' "==> Saved. Current profile:"; cat "$CONF"
+    fi
     exit 0
 fi
 

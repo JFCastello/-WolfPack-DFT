@@ -77,10 +77,29 @@ MARKER_TARGET = 0          # markers per k-path: 0 -> one per actual k-point
 PROJ_CUTOFF = 1e-3         # ignore points whose group weight is below this
 
 # --------------------------------------------------------------------------- #
+# Spin markers (plain / one_orbital / duo / rgb, ONLY when both spins are shown)
+# --------------------------------------------------------------------------- #
+# With both spin channels overlaid, circles are replaced by very small
+# triangles so the two channels never sit ambiguously on top of each other:
+# spin-up -> up-triangle, spin-down -> down-triangle. The marker EDGE encodes
+# the spin too -- pure cyan for up, pure magenta for down -- which stays visible
+# even where the (weight-dependent) face is almost transparent.
+SPIN_UP_MARKER = "^"
+SPIN_DOWN_MARKER = "v"
+# Dark cyan / dark magenta: a sweet spot that reads clearly against the white
+# background (bright pure cyan/magenta wash out there) yet stays distinct from
+# the face colours inside the triangles (duo blue/orange, rgb red/green/blue),
+# so the spin outline never gets confused with the projection colour.
+SPIN_UP_EDGE = "#0B9AA6"   # dark cyan   (spin up)
+SPIN_DOWN_EDGE = "#C2188C" # dark magenta (spin down)
+SPIN_EDGE_LW = 0.5         # triangle outline width (pt) -- keep them tiny
+
+# --------------------------------------------------------------------------- #
 # "plain" method: black k-point dots on the shared backbone
 # --------------------------------------------------------------------------- #
-PLAIN_MARKER_SIZE = 4.0    # small solid black circle area (pt^2)
+PLAIN_MARKER_SIZE = 4.0    # small black circle/triangle area (pt^2)
 PLAIN_MARKER_COLOR = "#000000"
+PLAIN_ALPHA = 0.5          # intermediate opacity of the plain k-point markers
 PLAIN_EVERY_KPOINT = True  # a dot at every computed k-point (no subsampling)
 
 # --------------------------------------------------------------------------- #
