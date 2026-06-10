@@ -222,11 +222,17 @@ def main():
     ncore = max(ncore_t, 1)
     unit = kpar * ncore
     cap = args.max_cores or args.cpus_per_node
-    target = args.prod_ranks if args.prod_ranks > 0 else cap
-    target = min(target, cap) if cap else target
+    # Default to the TESTED rank count: at that scale the per-rank memory is the
+    # MEASURED value exactly (no extrapolation), which is the most reliable. Use
+    # --prod-ranks to scale up (memory is then extrapolated by the model).
+    if args.prod_ranks > 0:
+        target = min(args.prod_ranks, cap) if cap else args.prod_ranks
+    else:
+        target = nt
     prod = max(unit, (target // unit) * unit)
     npar = max(1, prod // unit)
     prod = unit * npar                                   # exact multiple of unit
+    extrapolated = (prod != nt)
 
     # --- per-rank need at production, then the 80%-utilisation request -------- #
     need = per_rank(prod, npar, ncore)
@@ -284,7 +290,14 @@ def main():
     print()
 
     print("[MEMORY  (measured -> request)]")
-    print(f"  model                   : {mem_model}")
+    if extrapolated:
+        print(f"  basis                   : EXTRAPOLATED from {nt} to {prod} ranks "
+              f"({mem_model})")
+        print("                            (less certain than the measured scale; "
+              "to be safe, benchmark at this size with --debug-nodes)")
+    else:
+        print(f"  basis                   : MEASURED directly at {prod} ranks "
+              "(no extrapolation)")
     print(f"  predicted use / rank    : {need:.0f} MB  (at {prod} ranks)")
     print(f"  utilisation policy       : request so use >= {args.mem_util*100:.0f}% of alloc")
     print(f"  --mem-per-cpu           : {mem_per_cpu} MB   "

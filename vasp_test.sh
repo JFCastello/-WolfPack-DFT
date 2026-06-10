@@ -17,13 +17,13 @@
 #   rank and the CPU efficiency of YOUR current INCAR parallel settings. When
 #   the budget is up the run is stopped and the script:
 #
-#     1. Reads the SLURM accounting metrics (MaxRSS, CPU efficiency) and the
-#        OUTCAR (per-SCF-step wall time, VASP's own memory table).
-#     2. Feeds the resulting OUTCAR to vasp_recommend_slurm.py
-#        (vasp-recommend-slurm) and CALIBRATES its memory model with the measured
-#        MaxRSS, so the prediction matches what the job really used.
-#     3. Prints a ready-to-submit SLURM script for the MAIN partition and an
-#        INCAR snippet (KPAR / NCORE / NSIM) tuned for this exact job.
+#     1. Reads the SLURM accounting metrics (MaxRSS, CPU efficiency), the
+#        parallel layout the run used, and the OUTCAR memory breakdown.
+#     2. Builds the production recommendation from those MEASURED numbers
+#        (memory anchored to MaxRSS, KPAR/NCORE/NSIM from the run) -- it does
+#        NOT re-run vasp-recommend's model.
+#     3. Writes a ready-to-submit MAIN-partition SLURM script + an INCAR snippet
+#        (KPAR / NCORE / NSIM), sized to your cluster's memory policies.
 #
 #   The benchmark runs inside a fresh sub-directory (vasp_test_<jobid>/) built
 #   from copies of your inputs, so your existing OUTCAR/WAVECAR/etc. are never
@@ -322,9 +322,12 @@ vasp_tbl_mb=$(awk '/total amount of memory used by VASP MPI-rank0/{
 vasp_tbl_mb="${vasp_tbl_mb:-0}"
 
 # Per-electronic-step wall time and step count from the OUTCAR.
-nscf=$(grep -c 'LOOP:' "$OUTCAR" 2>/dev/null || echo 0)
+# NB: `grep -c` prints "0" AND exits 1 on zero matches, so `|| echo 0` would
+# append a second line ("0\n0"). Capture it plain and sanitise to one integer.
+nscf=$(grep -c 'LOOP:' "$OUTCAR" 2>/dev/null); nscf="${nscf//[^0-9]/}"; nscf="${nscf:-0}"
 avg_loop=$(awk '/LOOP:/{ k=split($0,a,"real time"); if(k>1){ s+=a[2]+0; c++ } }
                 END{ if(c>0) printf "%.2f", s/c; else printf "0" }' "$OUTCAR")
+avg_loop="${avg_loop:-0}"
 
 if posq "$maxrss_mb" && [[ -n "$RAW" ]]; then
     node_avail_gb=$(awk -v m="$NODE_MEM_MB" 'BEGIN{printf "%.0f", m/1024.0}')
@@ -383,7 +386,16 @@ MAXCORES="${WP_MAX_CORES:-$MAIN_CPN}"
 PROD_TIME="${VASP_TEST_PROD_TIME:-7-00:00:00}"
 MODS="$(_wp_module_block)"
 
-"$PY" "$HELPER" "$OUTCAR" \
+# Sanitise the numeric metrics one more time (defensive: argparse needs clean
+# ints/floats, and a stray newline here would abort the whole recommendation).
+maxrss_mb="${maxrss_mb//[!0-9.]/}"; maxrss_mb="${maxrss_mb:-0}"
+cpu_eff="${cpu_eff//[!0-9.]/}"; cpu_eff="${cpu_eff:-0}"
+avg_loop="${avg_loop//[!0-9.]/}"; avg_loop="${avg_loop:-0}"
+nscf="${nscf//[!0-9]/}"; nscf="${nscf:-0}"
+wall="${wall//[!0-9]/}"; wall="${wall:-0}"
+NTASKS="${NTASKS//[!0-9]/}"; NTASKS="${NTASKS:-1}"
+
+if "$PY" "$HELPER" "$OUTCAR" \
     --maxrss-mb "$maxrss_mb" --ntasks-test "$NTASKS" \
     --avg-loop "$avg_loop" --cpu-eff "$cpu_eff" --nscf "$nscf" --wall "$wall" \
     --partition main --slurm-partition "$MAIN_PART" \
@@ -393,10 +405,17 @@ MODS="$(_wp_module_block)"
     --email "$EMAIL" --job-name "$JOBNAME" --exe "$VASP_EXE" --time "$PROD_TIME" \
     --modules "$MODS" --extra-env "${WP_EXTRA_ENV:-}" \
     --write-slurm "$SUBMIT_DIR/slurm_job.sh" --write-incar "$SUBMIT_DIR/INCAR.parallel"
-
-hdr "DONE"
-echo "  Benchmark inputs/outputs kept in: $RUNDIR"
-echo "  Production files written to your submit directory:"
-echo "    $SUBMIT_DIR/slurm_job.sh     (sbatch this to run the real calculation)"
-echo "    $SUBMIT_DIR/INCAR.parallel   (merge KPAR/NCORE/NSIM into your INCAR)"
+then
+    hdr "DONE"
+    echo "  Benchmark inputs/outputs kept in: $RUNDIR"
+    echo "  Production files written to your submit directory:"
+    echo "    $SUBMIT_DIR/slurm_job.sh     (sbatch this to run the real calculation)"
+    echo "    $SUBMIT_DIR/INCAR.parallel   (merge KPAR/NCORE/NSIM into your INCAR)"
+else
+    hdr "DONE (recommendation step failed -- see the error above)"
+    echo "  The benchmark itself succeeded; only the recommendation helper failed."
+    echo "  Your MEASURED peak memory was ${maxrss_mb} MB/rank on ${NTASKS} ranks."
+    echo "  Size production from that: request MaxRSS / ${MEM_UTIL} per rank."
+    echo "  Benchmark inputs/outputs kept in: $RUNDIR"
+fi
 echo "  end: $(date)"
