@@ -142,12 +142,14 @@ diagnose_modules() {
     printf '%s\n' "$err" | grep -iE 'error|cannot be loaded|unknown|not found|conflict' | head -6
 }
 
-# List VASP modules from 'module avail'/'spider' (names only).
+# List VASP modules from 'module avail'/'spider' (names only). Drops Lmod
+# family placeholders like "vasp/" / "VASP/" (a trailing slash, no version) --
+# those are not loadable and only clutter the menu.
 detect_vasp_modules() {
     { run_module -t avail 2>&1; run_module -t spider 2>&1; } 2>/dev/null \
       | grep -iE 'vasp' \
       | sed -E 's/[[:space:]]*$//; s/\(default\)//I; s/:$//' \
-      | grep -vE '^/|^[[:space:]]*$' \
+      | grep -vE '^/|^[[:space:]]*$|/$' \
       | awk '{$1=$1; print}' | sort -u
 }
 
