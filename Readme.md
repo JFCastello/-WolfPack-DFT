@@ -112,7 +112,7 @@ pass `--purge-repo`.
 |---------|--------------|--------------|
 | `vasp-configure` | `vasp_configure.sh` | Build your cluster profile (email, VASP modules, partitions, cores, memory, max-cores) |
 | `vasp-dry-run` | `vasp_dry_run.sh` | Submit a 1-rank VASP dry run to your debug partition |
-| `vasp-test` | `vasp_test.sh` | 11-min debug benchmark → measured RAM/efficiency → calibrated main-partition INCAR + SLURM script |
+| `vasp-test` | `vasp_test.sh` | 11-min debug benchmark → measured RAM/efficiency → **measurement-based** main-partition INCAR + SLURM script (80%-mem policy, debug reserve) |
 | `vasp-recommend-slurm` | `vasp_recommend_slurm.py` | Read dry-run OUTCAR → suggest KPAR/NCORE + SLURM script |
 | `vasp-check` | `vasp_check.sh` | Post-mortem sanity + physics analysis of any VASP run |
 | `vasp-clean` | `vasp_clean.sh` | Selective cleanup of VASP output files (with dry-run) |
@@ -137,10 +137,11 @@ Two paths to a tuned INCAR + SLURM script. Both end in `vasp-recommend-slurm`:
 
 - **Fast / cheap (`vasp-dry-run` → `vasp-recommend-slurm`):** a ~30 s 1-rank dry run
   predicts memory from VASP's own table. No real timing.
-- **Calibrated (`vasp-test`):** an 11-min real benchmark on one debug node that
-  *measures* peak RAM and parallel efficiency, then calibrates the recommender
-  with the measured numbers. Use this when you want the production memory ask
-  grounded in reality. See [section 1b](#1b-calibrated-benchmark-vasp-test).
+- **Measurement-based (`vasp-test`):** an 11-min real benchmark that *measures*
+  peak RAM and parallel efficiency, then builds the production recommendation
+  directly from those numbers (memory anchored to the measured `MaxRSS`, layout
+  from the run) — not from a model. See
+  [section 1b](#1b-measurement-based-benchmark-vasp-test).
 
 ### Step 1: `vasp-dry-run`
 
@@ -183,7 +184,7 @@ vasp-recommend-slurm --help                 # full flag list
 
 ---
 
-## 1b. Calibrated benchmark: `vasp-test`
+## 1b. Measurement-based benchmark: `vasp-test`
 
 A one-shot alternative to the dry-run path that **measures** real resource use
 instead of predicting it. Submit it from a calculation directory:
@@ -198,38 +199,51 @@ Like `vasp-dry-run`, it first writes a self-contained **`slurm_vasptest.sh`**
 that ran is on disk too — separate from the **`slurm_job.sh`** it writes at the
 end (the recommended *production* job).
 
-What it does, all in one SLURM job on **one debug node (48 cores, 360 GB)**:
+What it does, all in one SLURM job on the **debug partition** (geometry from your
+profile):
 
 1. Copies your inputs into an isolated `vasp_test_<jobid>/` folder (your
    existing OUTCAR/WAVECAR/etc. are never touched) and runs **real VASP** with
    your current INCAR parallel settings for `VASP_TEST_MINUTES` (default 11).
-2. Reads the **SLURM accounting metrics** (`MaxRSS` per rank, CPU efficiency)
-   and the OUTCAR (per-SCF-step wall time, VASP's own memory table).
-3. **Calibrates** `vasp-recommend-slurm`'s memory model with the measured `MaxRSS`
-   (correction factor → `--mem-headroom`), so the production memory ask matches
-   what the job really used.
-4. Prints, ready to copy-paste, an **INCAR snippet** (`KPAR` / `NCORE` / `NSIM`)
-   and a **`main`-partition SLURM script** tuned for this exact job, and **writes
-   them to your submit directory** as `slurm_job.sh` and `INCAR.parallel`
-   (so the exact production job is on disk — just `sbatch slurm_job.sh`).
+2. Reads the **SLURM accounting metrics** (`MaxRSS` per rank, CPU efficiency),
+   the parallel layout the run used (KPAR/NCORE/NPAR), and the OUTCAR memory
+   breakdown.
+3. **Builds the production recommendation entirely from the measurement** (it
+   does *not* re-run `vasp-recommend`'s model): per-rank memory is **anchored to
+   the measured `MaxRSS`** and scaled to the production rank layout; `KPAR` /
+   `NCORE` / `NSIM` come from the run.
+4. Sizes the memory **request** to your cluster's policies (next section), prints
+   an **INCAR snippet** + a **`main`-partition SLURM script**, and writes them to
+   your submit directory as `slurm_job.sh` and `INCAR.parallel`
+   (just `sbatch slurm_job.sh`).
 
 The report and copy-paste blocks also land in the job's `vasp_test-<jobid>.out`.
 
-**Tunables** (export before `sbatch`, or pass with `--export`):
+**Cluster policies (sane defaults; override via env):**
 
-| Variable | Default | Meaning |
-|----------|---------|---------|
+- **Memory utilisation** — the request is sized so the job *uses* ≥ 80 % of what
+  it asks for (`request = measured_use / 0.80`), satisfying clusters that require
+  high memory utilisation while keeping a ~20 % safety margin.
+- **Debug/login reserve** — when sizing a debug-partition job, **16 GB per node**
+  is kept free so the (shared) login node doesn't collapse.
+
+**Flags & tunables:**
+
+| Flag / variable | Default | Meaning |
+|-----------------|---------|---------|
+| `--debug-nodes N` | `1` | debug nodes to reserve for the benchmark (`2` → 96 ranks, 48/node) |
+| `--prod-ranks N` | auto (core cap) | total ranks to size the production job for |
 | `VASP_TEST_MINUTES` | `11` | length of the timed run (≤ ~25 on debug) |
 | `VASP_EXE` | `vasp_std` | `vasp_std` / `vasp_gam` / `vasp_ncl` |
-| `VASP_TEST_EMAIL` | your email | email written into the emitted script |
-| `VASP_TEST_JOBNAME` | `VASP` | `--job-name` written into the emitted script |
+| `VASP_TEST_MEM_UTIL` | `0.80` | request memory so usage ≥ this fraction |
+| `VASP_TEST_DEBUG_MARGIN_MB` | `16384` | memory kept free per debug/login node |
+| `VASP_TEST_PROD_TIME` | `7-00:00:00` | `--time` of the production job |
 
-The debug partition, cores/node, memory/node and email come from your
-`vasp-configure` profile (run `vasp-configure --show` to check them).
+The debug/main partitions, cores/node, memory/node, modules and email all come
+from your `vasp-configure` profile (`vasp-configure --show` to check).
 
-> Requires SLURM job accounting (`sacct`/`MaxRSS`) for the calibration step.
-> If it is off, `vasp-test` still recommends a layout from VASP's own memory
-> table — it just can't ground it in measured RAM.
+> Requires SLURM job accounting (`sacct`/`MaxRSS`) so memory can be anchored to
+> the measured peak. If it is off, it falls back to VASP's own memory table.
 
 ---
 
@@ -475,7 +489,7 @@ vasp-clean -n .                           # → preview what to remove
 vasp-clean -f .                           # → clean up (no prompt)
 ```
 
-### New calculation (calibrated path)
+### New calculation (measurement-based path)
 ```bash
 vasp-test                                 # → 11-min benchmark; the .out file
                                           #   holds a measured INCAR + SLURM
