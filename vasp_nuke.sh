@@ -11,7 +11,7 @@
 #   CHG  CHGCAR  CONTCAR  DOSCAR  EIGENVAL  IBZKPT  OSZICAR  OUTCAR
 #   PCDAT  PROCAR  REPORT  vasprun.xml  WAVECAR  XDATCAR  WAVEDER
 #   vaspout.h5  LOCPOT  ELFCAR  PROOUT  TMPCAR  HILLSPOT  PENALTYPOT
-#   CHGCAR.tmp  WAVECAR.tmp
+#   CHGCAR.tmp  WAVECAR.tmp   .wolfpack/ (hidden pipeline scratch + state)
 #
 # FILES PRESERVED
 #   INCAR  POSCAR  POTCAR  KPOINTS  and everything else not listed above.
@@ -33,5 +33,6 @@ rm -f CHG CHGCAR CONTCAR DOSCAR EIGENVAL IBZKPT OSZICAR OUTCAR \
       PCDAT PROCAR REPORT vasprun.xml WAVECAR XDATCAR WAVEDER \
       vaspout.h5 LOCPOT ELFCAR PROOUT TMPCAR HILLSPOT PENALTYPOT \
       CHGCAR.tmp WAVECAR.tmp
+rm -rf .wolfpack          # hidden pipeline scratch/state + old SLURM logs
 
 echo "VASP output files removed from $dir."

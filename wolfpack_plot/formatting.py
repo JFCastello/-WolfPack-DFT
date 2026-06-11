@@ -62,6 +62,7 @@ _GREEK_UNICODE = {
 
 
 def _orb_tex(tok: str) -> str:
+    """TeX label for an orbital token (e.g. 'dz2' -> d_{z^2})."""
     return _ORB_TEX.get(tok, r"\mathrm{%s}" % tok)
 
 

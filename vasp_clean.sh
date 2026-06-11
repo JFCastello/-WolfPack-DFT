@@ -85,6 +85,7 @@ ${BOLD}USAGE${RESET}
 
 ${BOLD}REMOVED BY DEFAULT${RESET}
   WAVECAR  CHG  TMPCAR  vasprun.tmp  PCDAT  WAVEDER  STOPCAR  REPORT  HILLSPOT
+  .wolfpack/   (hidden pipeline scratch + old SLURM logs; safe once slurm.sh exists)
 
 ${BOLD}REMOVED WITH --aggressive${RESET}
   CHGCAR  LOCPOT  ELFCAR  PROCAR  DOSCAR  EIGENVAL  XDATCAR  AECCAR0/1/2
@@ -144,8 +145,8 @@ is_vasp_dir() {
 }
 
 human_size() {
-    # human-readable size of a file; "-" if missing
-    [[ -f "$1" ]] && du -h "$1" 2>/dev/null | awk '{print $1}' || echo "-"
+    # human-readable size of a file OR directory; "-" if missing
+    [[ -e "$1" ]] && du -sh "$1" 2>/dev/null | awk '{print $1}' || echo "-"
 }
 
 human_total() {
@@ -177,6 +178,11 @@ gather_targets() {
         [[ -f "$d/$f.gz" ]] && found+=("$d/$f.gz")
     done
 
+    # hidden pipeline scratch/state dir (vasp-dry-run/recommend/test). Pure
+    # scratch + old SLURM logs once you have slurm.sh + report.out, so it is
+    # always safe to remove. It is a directory, so clean_dir uses 'rm -rf'.
+    [[ -d "$d/.wolfpack" ]] && found+=("$d/.wolfpack")
+
     if [[ ${#found[@]} -gt 0 ]]; then
         printf '%s\n' "${found[@]}"
     fi
@@ -207,7 +213,7 @@ clean_dir() {
     for f in "${files[@]}"; do
         size=$(human_size "$f")
         printf "    %-8s  %s\n" "$size" "$(basename "$f")"
-        kb=$(du -k "$f" 2>/dev/null | awk '{print $1}')
+        kb=$(du -sk "$f" 2>/dev/null | awk '{print $1}'); kb=${kb//[^0-9]/}
         total_kb=$((total_kb + ${kb:-0}))
     done
     echo "    ${DIM}---------------${RESET}"
@@ -227,7 +233,7 @@ clean_dir() {
     fi
 
     for f in "${files[@]}"; do
-        rm -f -- "$f"
+        rm -rf -- "$f"           # -r so the .wolfpack/ dir is removed too
         [[ $VERBOSE -eq 1 ]] && echo "    ${DIM}rm $f${RESET}"
     done
     echo "    ${GREEN}cleaned (~$(human_total "$total_kb") freed)${RESET}"

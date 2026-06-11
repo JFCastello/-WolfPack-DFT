@@ -15,7 +15,6 @@ import numpy as np
 from pymatgen.io.vasp.outputs import BSVasprun, Outcar, Vasprun
 
 from .config import DEFAULT_SMEAR, EMAX, EMIN
-from .formatting import _GREEK_UNICODE  # noqa: F401  (kept for parity/imports)
 
 
 # --------------------------------------------------------------------------- #
@@ -131,6 +130,7 @@ def _segment_ticks(distance, labels, sl):
 # Parsing VASP output
 # --------------------------------------------------------------------------- #
 def read_fermi(scf_dir: Path, fallback_dir=None) -> float:
+    """Read the Fermi energy from the SCF run (vasprun.xml), with a fallback dir."""
     vxml = scf_dir / "vasprun.xml"
     if vxml.is_file():
         try:
@@ -159,6 +159,7 @@ def read_fermi(scf_dir: Path, fallback_dir=None) -> float:
 
 
 def read_bands(bands_dir: Path, efermi: float):
+    """Read the band structure + projections from Bands/ into a dict."""
     vxml, kpts = bands_dir / "vasprun.xml", bands_dir / "KPOINTS"
     if not vxml.is_file():
         raise FileNotFoundError(f"Missing {vxml}")
@@ -200,6 +201,7 @@ def read_bands(bands_dir: Path, efermi: float):
 
 
 def read_dos(dos_dir: Path, efermi: float):
+    """Read the total + projected DOS from Dos/ into a dict."""
     vxml = dos_dir / "vasprun.xml"
     if not vxml.is_file():
         raise FileNotFoundError(f"Missing {vxml}")

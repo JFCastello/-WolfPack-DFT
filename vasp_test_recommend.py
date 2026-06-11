@@ -2,75 +2,41 @@
 """
 vasp_test_recommend.py   (internal helper for vasp-test; not a user command)
 ===========================================================================
-Turn the MEASURED results of a `vasp-test` benchmark into a production-job
-recommendation.  Unlike vasp-recommend (which PREDICTS memory from VASP's own
-table + a model), this anchors everything to what the benchmark ACTUALLY used:
+STAGE 3 of the dry-run -> recommend -> test pipeline.
 
-  * per-rank memory is anchored to the measured SLURM MaxRSS, then scaled to the
-    production rank layout using the VASP component-distribution rules
-    (wavefunctions ~ 1/total_ranks, grid ~ 1/NPAR, projectors ~ 1/NCORE);
-  * KPAR / NCORE / NSIM are taken from the layout the benchmark actually ran;
-  * the memory REQUEST honours two cluster policies passed in on the CLI:
-      - a minimum memory-utilisation fraction (e.g. 0.80): the job must use at
-        least this fraction of what it requests, so we request need/fraction;
-      - a per-node reserve (e.g. 16 GB) kept free on the debug/login partition
-        so interactive logins are not starved.
+vasp-recommend produced a FIXED parallel configuration (KPAR/NCORE/NSIM and a
+target rank count, e.g. 120) and wrote it into slurm.sh. The benchmark cannot
+fit 120 ranks on the 96-core debug partition, so vasp-test ran the SAME fixed
+config at a smaller, debug-sized rank count and measured the real per-rank
+memory (SLURM MaxRSS).
 
-Output mirrors vasp-recommend's format: a [MEASURED] block, an [INCAR SNIPPET]
-and a ready-to-submit [SLURM SCRIPT]; it also writes slurm_job.sh + INCAR.parallel.
+This helper then:
+  * scales the measured per-rank memory from the TEST rank count to the
+    PRODUCTION rank count using the VASP component-distribution rules
+    (wavefunctions ~ 1/total_ranks, grid ~ 1/NPAR, projectors ~ 1/NCORE),
+    anchored to the measurement;
+  * sizes the production memory REQUEST to the cluster's >=80% utilisation rule
+    (request = predicted_use / mem_util), splitting across nodes if one node
+    cannot hold its ranks;
+  * UPDATES slurm.sh in place (mem-per-cpu, nodes, ntasks-per-node);
+  * prints a VERDICT on whether the recommended config is adequate and appends
+    a STAGE 3 section to report.out.
 
-This module is intentionally dependency-free (Python stdlib only) so it runs on
-a compute node with any python3.
+Stdlib only -- runs on any compute node with python3.
 """
 from __future__ import annotations
 
 import argparse
 import math
-import os
 import re
 from pathlib import Path
 
 
 # --------------------------------------------------------------------------- #
-# OUTCAR parsing (self-contained; mirrors the patterns in vasp_recommend_slurm)
+# OUTCAR memory breakdown (for the test -> production scaling)
 # --------------------------------------------------------------------------- #
-def _read(path):
-    try:
-        return Path(path).read_text(errors="replace")
-    except OSError:
-        return ""
-
-
-def _int(patterns, text):
-    for p in patterns:
-        m = re.search(p, text, re.IGNORECASE | re.MULTILINE)
-        if m:
-            try:
-                return int(m.group(1))
-            except (ValueError, IndexError):
-                pass
-    return None
-
-
-def parse_outcar_layout(text):
-    """Return the parallel layout VASP actually used: (total, kpar, ncore, npar)."""
-    total = _int([r"running on\s+(\d+)\s+total cores"], text)
-    kpar = ncore = npar = None
-    m = re.search(r"distrk:\s*each k-point on\s+\d+\s+cores,\s*(\d+)\s+groups", text, re.I)
-    if m:
-        kpar = int(m.group(1))
-    m = re.search(r"distr:\s*one band on\s+NCORE\s*=\s*(\d+)\s+cores,\s*(\d+)\s+groups", text, re.I)
-    if m:
-        ncore, npar = int(m.group(1)), int(m.group(2))
-    if not total and kpar and ncore and npar:
-        total = kpar * ncore * npar
-    if total and kpar and ncore and not npar:
-        npar = max(1, (total // kpar) // ncore)
-    return total, kpar, ncore, npar
-
-
-def parse_outcar_memory(text):
-    """Return the rank-0 memory breakdown in MB (keys may be 0.0 if absent)."""
+def parse_outcar_memory(text: str) -> dict:
+    """Parse the rank-0 memory breakdown (base/wave/grid/...) from OUTCAR text."""
     out = dict(base=0.0, nonlr=0.0, fft=0.0, grid=0.0, one=0.0, wave=0.0, total=0.0)
     m = re.search(r"total amount of memory used by VASP MPI-rank0\s+([0-9.]+)\.?\s*k[bB]ytes", text)
     if m:
@@ -85,260 +51,195 @@ def parse_outcar_memory(text):
     return out
 
 
-# --------------------------------------------------------------------------- #
-# Memory model -- ANCHORED to the measured MaxRSS
-# --------------------------------------------------------------------------- #
-def make_memory_estimator(maxrss_mb, mem, nt, npar_t, ncore_t):
-    """Return per_rank(ranks, npar, ncore) -> MB, anchored to the measurement.
-
-    The OUTCAR breakdown gives the component split at the TEST layout; we scale
-    each component by its VASP distribution rule and multiply by a single
-    correction factor so the model reproduces the MEASURED MaxRSS exactly at the
-    test point. If no breakdown is available we fall back to scaling MaxRSS with
-    a wavefunction-dominant 70%/30% (variable/fixed) split.
-    """
+def make_estimator(maxrss_mb, mem, nt, npar_t, ncore_t):
+    """per_rank(ranks, npar, ncore) -> MB, anchored to the measured MaxRSS."""
     def model_total(ranks, npar, ncore):
+        """Modelled total per-rank MB at a layout (VASP component-distribution rules)."""
         return (mem["base"] + mem["fft"] + mem["one"]
                 + mem["wave"] * nt / max(ranks, 1)
                 + mem["grid"] * npar_t / max(npar, 1)
                 + mem["nonlr"] * ncore_t / max(ncore, 1))
-
     m_test = model_total(nt, npar_t, ncore_t)
     have_table = m_test > 1.0 and (mem["wave"] > 0 or mem["grid"] > 0)
-    if have_table and maxrss_mb > 0:
-        corr = maxrss_mb / m_test          # anchor to the measurement
-    elif have_table:
-        corr = 1.0                         # no MaxRSS: trust VASP's own table
-    else:
-        corr = None                        # neither: flat fallback below
+    corr = (maxrss_mb / m_test) if (have_table and maxrss_mb > 0) else None
 
     def per_rank(ranks, npar, ncore):
+        """Per-rank MB at (ranks, npar, ncore), anchored to the measured MaxRSS."""
         if corr is not None:
             return corr * model_total(ranks, npar, ncore)
-        if maxrss_mb > 0:                      # no usable table: conservative
-            return maxrss_mb * (0.30 + 0.70 * nt / max(ranks, 1))
-        return None
-
-    return per_rank, corr, m_test
+        # No usable table: wavefunction-dominant 70%/30% split of MaxRSS.
+        return maxrss_mb * (0.30 + 0.70 * nt / max(ranks, 1))
+    return per_rank, corr
 
 
 def round_up(x, step=50):
+    """Round `x` up to the next multiple of `step`."""
     return int(math.ceil(max(x, 1.0) / step) * step)
 
 
-# --------------------------------------------------------------------------- #
-# SLURM script (vasp-recommend-compatible format)
-# --------------------------------------------------------------------------- #
-def slurm_script(*, job_name, partition, time_limit, ntasks, ntpn, mem_per_cpu,
-                 email, modules, extra_env, exe):
-    L = ["#!/bin/bash",
-         f'#SBATCH --job-name="{job_name}"',
-         f"#SBATCH --partition={partition}",
-         f"#SBATCH --time={time_limit}",
-         f"#SBATCH --ntasks={ntasks}",
-         f"#SBATCH --ntasks-per-node={ntpn}",
-         "#SBATCH --cpus-per-task=1",
-         f"#SBATCH --mem-per-cpu={mem_per_cpu}",
-         "#SBATCH --output=%x-%j.out",
-         "#SBATCH --error=%x-%j.err"]
-    if email:
-        L += [f"#SBATCH --mail-user={email}", "#SBATCH --mail-type=ALL"]
-    L += ["", "# --- Modules (from your cluster profile) ---"]
-    L += [m for m in modules if m.strip()]
-    if extra_env:
-        L += ["", "# --- Environment ---"]
-        L += [e.strip() for e in extra_env.split(";") if e.strip()]
-    L += ["", 'echo "Inicio: $(date)"',
-          f"/usr/bin/time -v srun --cpu-bind=cores {exe}",
-          'echo "Fin:    $(date)"']
-    return "\n".join(L)
+def geometry(total, cpn, mem_per_cpu, node_mem, reserve=0):
+    """(nodes, ntasks_per_node) that fit BOTH the cores and the node memory."""
+    usable = max(mem_per_cpu, node_mem - max(reserve, 0))
+    by_mem = max(1, usable // max(mem_per_cpu, 1))
+    ntpn = min(cpn, total, by_mem)
+    nodes = max(1, math.ceil(total / ntpn))
+    ntpn = min(cpn, math.ceil(total / nodes))
+    return nodes, ntpn
 
 
-def incar_snippet(kpar, ncore, npar, nsim):
-    return ("# --- Parallelization tailored from your vasp-test benchmark ---\n"
-            f"KPAR   = {kpar}\n"
-            f"NCORE  = {ncore}\n"
-            f"NSIM   = {nsim}\n"
-            "LPLANE = .TRUE.\n"
-            f"# Derived only: NPAR = {npar}  (do NOT set BOTH NCORE and NPAR)\n"
-            "# I/O hygiene:\n"
-            "LWAVE  = .FALSE.\n"
-            "LCHARG = .FALSE.\n"
-            "LVTOT  = .FALSE.")
+def _sub(text, pattern, repl):
+    """Replace the first multiline match of `pattern` with `repl`."""
+    return re.sub(pattern, repl, text, count=1, flags=re.MULTILINE)
 
 
-# --------------------------------------------------------------------------- #
-# Main
-# --------------------------------------------------------------------------- #
+def update_slurm(path, mem_per_cpu, nodes, ntpn):
+    """Rewrite the production slurm.sh memory/geometry in place."""
+    try:
+        t = Path(path).read_text()
+    except OSError:
+        return False
+    t = _sub(t, r"^#SBATCH --mem-per-cpu=.*$", f"#SBATCH --mem-per-cpu={mem_per_cpu}")
+    t = _sub(t, r"^#SBATCH --nodes=.*$", f"#SBATCH --nodes={nodes}")
+    t = _sub(t, r"^#SBATCH --ntasks-per-node=.*$", f"#SBATCH --ntasks-per-node={ntpn}")
+    if "updated by vasp-test" not in t:
+        t = t.replace("#!/bin/bash\n",
+                      "#!/bin/bash\n# (memory updated by vasp-test from a real "
+                      "benchmark; see report.out)\n", 1)
+    try:
+        Path(path).write_text(t)
+        return True
+    except OSError:
+        return False
+
+
 def main():
-    p = argparse.ArgumentParser(description="vasp-test measurement-based recommender")
+    """CLI entry: scale the measured memory to production, update slurm.sh and report.out."""
+    p = argparse.ArgumentParser(description="vasp-test STAGE 3: scale + update slurm.sh")
     p.add_argument("outcar", type=Path)
-    p.add_argument("--maxrss-mb", type=float, required=True,
-                   help="measured peak per-rank memory (SLURM MaxRSS), MB")
+    p.add_argument("--maxrss-mb", type=float, required=True)
     p.add_argument("--ntasks-test", type=int, required=True)
-    p.add_argument("--avg-loop", type=float, default=0.0)
-    p.add_argument("--cpu-eff", type=float, default=0.0)
-    p.add_argument("--nscf", type=int, default=0)
-    p.add_argument("--wall", type=int, default=0)
-    # target partition + policies
-    p.add_argument("--partition", default="main", help="logical target (main/debug)")
-    p.add_argument("--slurm-partition", default="main", help="real #SBATCH name")
+    p.add_argument("--test-kpar", type=int, default=1)
+    p.add_argument("--test-ncore", type=int, default=1)
+    p.add_argument("--test-npar", type=int, default=1)
+    # production (fixed) config from vasp-recommend
+    p.add_argument("--prod-ranks", type=int, required=True)
+    p.add_argument("--prod-kpar", type=int, default=1)
+    p.add_argument("--prod-ncore", type=int, default=1)
+    p.add_argument("--prod-npar", type=int, default=1)
+    p.add_argument("--prod-nsim", type=int, default=4)
+    p.add_argument("--prod-partition", default="main")
     p.add_argument("--cpus-per-node", type=int, required=True)
     p.add_argument("--node-mem-mb", type=int, required=True)
-    p.add_argument("--max-cores", type=int, default=0)
-    p.add_argument("--is-debug", action="store_true",
-                   help="apply the per-node reserve (debug/login partition)")
-    p.add_argument("--debug-margin-mb", type=int, default=16384)
-    p.add_argument("--mem-util", type=float, default=0.80,
-                   help="required memory-utilisation fraction (request need/util)")
-    p.add_argument("--prod-ranks", type=int, default=0, help="0 = auto")
-    p.add_argument("--nsim", type=int, default=4)
-    p.add_argument("--email", default="")
-    p.add_argument("--job-name", default="VASP")
-    p.add_argument("--exe", default="vasp_std")
-    p.add_argument("--time", default="7-00:00:00")
-    p.add_argument("--modules", default="", help="newline-joined module-load lines")
-    p.add_argument("--extra-env", default="")
-    p.add_argument("--write-slurm", type=Path, default=None)
-    p.add_argument("--write-incar", type=Path, default=None)
+    p.add_argument("--mem-util", type=float, default=0.80)
+    # measured timing / efficiency (for the verdict + report)
+    p.add_argument("--cpu-eff", type=float, default=0.0)
+    p.add_argument("--avg-loop", type=float, default=0.0)
+    p.add_argument("--nscf", type=int, default=0)
+    p.add_argument("--wall", type=int, default=0)
+    p.add_argument("--update-slurm", type=Path, default=None)
+    p.add_argument("--report", type=Path, default=None)
     args = p.parse_args()
 
-    text = _read(args.outcar)
-    nt_o, kpar_t, ncore_t, npar_t = parse_outcar_layout(text)
-    nt = args.ntasks_test or nt_o or 1
-    kpar_t = kpar_t or 1
-    ncore_t = ncore_t or 1
-    npar_t = npar_t or max(1, (nt // kpar_t) // ncore_t)
-    nkpts = _int([r"NKPTS\s*=\s*(\d+)"], text) or 0
-    nbands = _int([r"NBANDS\s*=\s*(\d+)"], text) or 0
+    text = ""
+    try:
+        text = Path(args.outcar).read_text(errors="replace")
+    except OSError:
+        pass
     mem = parse_outcar_memory(text)
+    per_rank, corr = make_estimator(args.maxrss_mb, mem, args.ntasks_test,
+                                    max(args.test_npar, 1), max(args.test_ncore, 1))
 
-    per_rank, corr, m_test = make_memory_estimator(
-        args.maxrss_mb, mem, nt, npar_t, ncore_t)
+    # Per-rank memory at the PRODUCTION layout, scaled from the measurement.
+    prod_use = per_rank(args.prod_ranks, max(args.prod_npar, 1),
+                        max(args.prod_ncore, 1))
+    mem_per_cpu = max(200, round_up(prod_use / max(args.mem_util, 0.05)))
+    nodes, ntpn = geometry(args.prod_ranks, args.cpus_per_node, mem_per_cpu,
+                           args.node_mem_mb)
+    per_node_use = ntpn * prod_use / 1024.0
+    per_node_req = ntpn * mem_per_cpu / 1024.0
 
-    # --- production layout: keep the TESTED kpar/ncore (tailored from the run) #
-    kpar = min(kpar_t, nkpts) if nkpts > 0 else kpar_t
-    kpar = max(kpar, 1)
-    ncore = max(ncore_t, 1)
-    unit = kpar * ncore
-    cap = args.max_cores or args.cpus_per_node
-    # Default to the TESTED rank count: at that scale the per-rank memory is the
-    # MEASURED value exactly (no extrapolation), which is the most reliable. Use
-    # --prod-ranks to scale up (memory is then extrapolated by the model).
-    if args.prod_ranks > 0:
-        target = min(args.prod_ranks, cap) if cap else args.prod_ranks
-    else:
-        target = nt
-    prod = max(unit, (target // unit) * unit)
-    npar = max(1, prod // unit)
-    prod = unit * npar                                   # exact multiple of unit
-    extrapolated = (prod != nt)
-
-    # --- per-rank need at production, then the 80%-utilisation request -------- #
-    need = per_rank(prod, npar, ncore)
-    if need and need > 0:
-        request_per_rank = need / max(args.mem_util, 0.05)
-        mem_per_cpu = max(round_up(request_per_rank, 50), 200)
-        mem_model = ("anchored to measured MaxRSS via the OUTCAR breakdown"
-                     if corr is not None else
-                     "scaled from measured MaxRSS (no OUTCAR table; 70/30 split)")
-    else:
-        mem_per_cpu = max(round_up(args.node_mem_mb / args.cpus_per_node, 50), 200)
-        need = mem_per_cpu * args.mem_util
-        mem_model = "partition default (no memory measurement available)"
-
-    # --- node packing, honouring the debug reserve --------------------------- #
-    usable_node = args.node_mem_mb - (args.debug_margin_mb if args.is_debug else 0)
-    ntpn = min(args.cpus_per_node, prod)
-    if mem_per_cpu * ntpn > usable_node:
-        ntpn = max(1, int(usable_node // mem_per_cpu))
-    # keep ntpn a divisor-friendly value and recompute node count
-    ntpn = min(ntpn, prod)
-    nodes = max(1, math.ceil(prod / ntpn))
-    per_node_mem_gb = ntpn * mem_per_cpu / 1024.0
-    used_per_node_gb = ntpn * need / 1024.0
-
-    # ----------------------------------------------------------------------- #
-    # Report
-    # ----------------------------------------------------------------------- #
-    bar = "=" * 78
-    print(bar)
-    print(" RECOMMENDED PRODUCTION SETUP  (tailored from your benchmark) ".center(78, "="))
-    print(bar)
-    print("Memory and layout below come from what THIS job actually measured,")
-    print("not from a generic model.\n")
-
-    print("[MEASURED  (from the benchmark run)]")
-    print(f"  test ranks              : {nt}  (KPAR={kpar_t}, NCORE={ncore_t}, NPAR={npar_t})")
-    print(f"  peak memory / rank      : {args.maxrss_mb:.0f} MB   (SLURM MaxRSS -- ground truth)")
-    if mem['total'] > 0:
-        print(f"  VASP rank-0 table total : {mem['total']:.0f} MB"
-              + (f"   (measured/table = x{corr:.2f})" if corr else ""))
+    # ------------------------------------------------------------------- #
+    # Verdict on the recommended (fixed) parallel config
+    # ------------------------------------------------------------------- #
+    verdict, advice = [], []
     if args.cpu_eff > 0:
-        print(f"  CPU efficiency          : {args.cpu_eff:.1f} %")
-    if args.avg_loop > 0:
-        print(f"  wall per SCF step       : {args.avg_loop:.2f} s   "
-              f"({args.nscf} steps in {args.wall}s)")
-    print(f"  NKPTS / NBANDS          : {nkpts} / {nbands}")
-    print()
-
-    print(f"[PRODUCTION LAYOUT  -> partition '{args.slurm_partition}']")
-    print(f"  total MPI ranks         : {prod}")
-    print(f"  nodes x ntasks-per-node : {nodes} x {ntpn}")
-    print(f"  KPAR / NCORE / NPAR     : {kpar} / {ncore} / {npar}   (from your run)")
-    print(f"  NSIM                    : {args.nsim}")
-    print()
-
-    print("[MEMORY  (measured -> request)]")
-    if extrapolated:
-        print(f"  basis                   : EXTRAPOLATED from {nt} to {prod} ranks "
-              f"({mem_model})")
-        print("                            (less certain than the measured scale; "
-              "to be safe, benchmark at this size with --debug-nodes)")
+        if args.cpu_eff >= 85:
+            verdict.append(f"parallel efficiency GOOD ({args.cpu_eff:.0f}%)")
+        elif args.cpu_eff >= 70:
+            verdict.append(f"parallel efficiency OK ({args.cpu_eff:.0f}%)")
+            advice.append("efficiency is moderate; a different KPAR/NCORE might be faster.")
+        else:
+            verdict.append(f"parallel efficiency LOW ({args.cpu_eff:.0f}%)")
+            advice.append("efficiency is poor; consider re-running vasp-recommend with "
+                          "different --nsim-choices, or fewer ranks.")
+    fits = mem_per_cpu * ntpn <= args.node_mem_mb
+    if fits and nodes == 1:
+        verdict.append("memory fits one node")
+    elif fits:
+        verdict.append(f"memory fits across {nodes} nodes")
+        advice.append(f"production memory needs {nodes} nodes ({ntpn} ranks/node) to fit.")
     else:
-        print(f"  basis                   : MEASURED directly at {prod} ranks "
-              "(no extrapolation)")
-    print(f"  predicted use / rank    : {need:.0f} MB  (at {prod} ranks)")
-    print(f"  utilisation policy       : request so use >= {args.mem_util*100:.0f}% of alloc")
-    print(f"  --mem-per-cpu           : {mem_per_cpu} MB   "
-          f"(= {need:.0f} / {args.mem_util:.2f}, rounded up)")
-    print(f"  -> per node             : {used_per_node_gb:.1f} GB used of "
-          f"{per_node_mem_gb:.1f} GB requested")
-    if args.is_debug:
-        print(f"  debug reserve kept free : {args.debug_margin_mb/1024:.0f} GB/node "
-              f"(usable {usable_node/1024:.0f} of {args.node_mem_mb/1024:.0f} GB)")
-        if mem_per_cpu * ntpn > usable_node:
-            print("  WARNING: even one rank exceeds the usable memory; lower the rank "
-                  "count or use the main partition.")
-    print()
+        verdict.append("memory does NOT fit")
+        advice.append("even one node can't hold this; reduce ranks or use a large-mem partition.")
+    adequate = (args.cpu_eff == 0 or args.cpu_eff >= 70) and fits
+    headline = ("ADEQUATE -- the recommended config works; memory updated below."
+                if adequate else
+                "REVIEW -- see the notes; the recommended config may need tuning.")
 
-    incar = incar_snippet(kpar, ncore, npar, args.nsim)
-    print("[INCAR SNIPPET]  (copy into your INCAR)")
-    print("-" * 78)
-    print(incar)
-    print("-" * 78)
-    print()
+    # ------------------------------------------------------------------- #
+    # Build the STAGE 3 report section
+    # ------------------------------------------------------------------- #
+    L = []
+    L.append("[BENCHMARK -- measured with the FIXED recommended config]")
+    L.append(f"  ran at                  : {args.ntasks_test} ranks "
+             f"(KPAR={args.test_kpar}, NCORE={args.test_ncore}, NPAR={args.test_npar})")
+    L.append(f"  peak memory / rank      : {args.maxrss_mb:.0f} MB   (SLURM MaxRSS)")
+    if args.cpu_eff > 0:
+        L.append(f"  CPU efficiency          : {args.cpu_eff:.1f} %")
+    if args.avg_loop > 0:
+        L.append(f"  wall per SCF step       : {args.avg_loop:.2f} s  "
+                 f"({args.nscf} steps in {args.wall}s)")
+    if mem["total"] > 0 and corr:
+        L.append(f"  VASP table / measured   : x{corr:.2f}  (real RSS vs VASP's table)")
+    L.append("")
+    L.append(f"[PRODUCTION -- the FIXED config at {args.prod_ranks} ranks]")
+    L.append(f"  KPAR / NCORE / NPAR     : {args.prod_kpar} / {args.prod_ncore} / {args.prod_npar}")
+    L.append(f"  NSIM                    : {args.prod_nsim}")
+    L.append(f"  layout                  : {nodes} node(s) x {ntpn} ranks-per-node "
+             f"on '{args.prod_partition}'")
+    L.append("")
+    L.append("[MEMORY -- measured, scaled to production, sized to the 80% rule]")
+    L.append(f"  predicted use / rank    : {prod_use:.0f} MB  "
+             f"(scaled {args.ntasks_test}->{args.prod_ranks} ranks)")
+    L.append(f"  --mem-per-cpu (request) : {mem_per_cpu} MB  "
+             f"(= {prod_use:.0f} / {args.mem_util:.2f})")
+    L.append(f"  per node                : {per_node_use:.0f} GB used of "
+             f"{per_node_req:.0f} GB requested  (target >= {args.mem_util*100:.0f}%)")
+    L.append("")
+    L.append(f"[VERDICT]  {headline}")
+    for v in verdict:
+        L.append(f"  - {v}")
+    for a in advice:
+        L.append(f"  ! {a}")
+    body = "\n".join(L)
 
-    modlines = [m for m in args.modules.split("\n")] if args.modules else []
-    script = slurm_script(job_name=args.job_name, partition=args.slurm_partition,
-                          time_limit=args.time, ntasks=prod, ntpn=ntpn,
-                          mem_per_cpu=mem_per_cpu, email=args.email or None,
-                          modules=modlines, extra_env=args.extra_env, exe=args.exe)
-    print("[SLURM SCRIPT]  (copy into job.sh; submit with `sbatch job.sh`)")
-    print("-" * 78)
-    print(script)
-    print("-" * 78)
+    print(body)
 
-    if args.write_slurm:
-        Path(args.write_slurm).write_text(script + "\n")
+    if args.update_slurm and update_slurm(args.update_slurm, mem_per_cpu, nodes, ntpn):
+        print(f"\n[FILES] updated production memory in {args.update_slurm} "
+              f"-> --mem-per-cpu={mem_per_cpu}, --nodes={nodes}, "
+              f"--ntasks-per-node={ntpn}")
+
+    if args.report:
+        bar = "#" * 78
+        import datetime as _dt
+        section = (f"\n{bar}\n#  STAGE 3/3 -- BENCHMARK + FINAL MEMORY (vasp-test)\n"
+                   f"#  {_dt.datetime.now():%Y-%m-%d %H:%M:%S}\n{bar}\n\n{body}\n")
         try:
-            os.chmod(args.write_slurm, 0o755)
+            with open(args.report, "a") as fh:
+                fh.write(section)
         except OSError:
             pass
-        print(f"\n[FILES] SLURM script  -> {args.write_slurm}")
-    if args.write_incar:
-        Path(args.write_incar).write_text(incar + "\n")
-        print(f"[FILES] INCAR snippet -> {args.write_incar}")
     return 0
 
 

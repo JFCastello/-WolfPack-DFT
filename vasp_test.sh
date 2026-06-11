@@ -2,64 +2,52 @@
 ###############################################################################
 # vasp_test.sh   (invoked on PATH as: vasp-test)
 #
-# Short VASP RESOURCE BENCHMARK on your cluster's debug partition.
+# STAGE 3/3 of the pipeline: VALIDATE the recommended config + set final memory.
 #
 # CLUSTER PROFILE
 #   The debug partition name, cores/node, memory/node, notification email and
 #   the VASP module(s) to load all come from the profile written by
-#   `vasp-configure` (~/.config/wolfpack-dft/cluster.conf). Built-in NLHPC
+#   `vasp-configure` (~/.config/wolfpack-dft/cluster.conf). Built-in example
 #   defaults are used if no profile exists.
 #
+# PIPELINE (run these three, in order, with NO arguments and NO manual steps):
+#   vasp-dry-run            # STAGE 1: dry run -> .wolfpack/dryrun_OUTCAR
+#   vasp-recommend-slurm    # STAGE 2: FIXED KPAR/NCORE/NSIM + ranks -> slurm.sh
+#   vasp-test               # STAGE 3: THIS SCRIPT
+#
 # WHAT IT DOES
-#   Submits a real (not dry-run) VASP calculation for a fixed, short wall time
-#   (default 11 minutes) on ONE whole debug node (cores/memory from your cluster
-#   profile). While it runs, the SLURM cgroup records the true peak memory per
-#   rank and the CPU efficiency of YOUR current INCAR parallel settings. When
-#   the budget is up the run is stopped and the script:
+#   Reads the FIXED parallel config vasp-recommend chose (from .wolfpack/state.env)
+#   and benchmarks THAT EXACT config -- not your raw INCAR. Because the recommended
+#   rank count (e.g. 120) will not fit on the debug partition, it runs the same
+#   KPAR/NCORE at the largest rank count that DOES fit (up to both debug nodes,
+#   96 cores), at the maximum debug memory (node RAM minus a 16 GB reserve), for
+#   30 minutes. When the budget is up it:
 #
-#     1. Reads the SLURM accounting metrics (MaxRSS, CPU efficiency), the
-#        parallel layout the run used, and the OUTCAR memory breakdown.
-#     2. Builds the production recommendation from those MEASURED numbers
-#        (memory anchored to MaxRSS, KPAR/NCORE/NSIM from the run) -- it does
-#        NOT re-run vasp-recommend's model.
-#     3. Writes a ready-to-submit MAIN-partition SLURM script + an INCAR snippet
-#        (KPAR / NCORE / NSIM), sized to your cluster's memory policies.
+#     1. Reads the SLURM metrics (MaxRSS, CPU efficiency) of the FIXED config.
+#     2. SCALES the measured per-rank memory from the test rank count up to the
+#        production rank count (VASP component-distribution rules).
+#     3. Sizes the production memory to your cluster's >=80% utilisation rule and
+#        UPDATES slurm.sh in place (mem-per-cpu, and nodes if it must split).
+#     4. Prints a VERDICT on whether the recommended config is adequate and
+#        appends STAGE 3 to report.out.
 #
-#   The benchmark runs inside a fresh sub-directory (vasp_test_<jobid>/) built
-#   from copies of your inputs, so your existing OUTCAR/WAVECAR/etc. are never
-#   touched.
-#
-#   The production recommendation is built FROM THE MEASUREMENT: per-rank memory
-#   is anchored to the SLURM MaxRSS the job actually used (then scaled to the
-#   production layout), KPAR/NCORE/NSIM come from the run, and the memory REQUEST
-#   honours your cluster policies (>=80% utilisation; a per-node reserve kept
-#   free on the debug/login node). It is NOT a re-run of vasp-recommend's model.
+#   The benchmark runs inside a throwaway sub-directory, so your existing
+#   OUTCAR/WAVECAR/etc. are never touched and the folder stays clean.
 #
 # USAGE
-#   cd <dir with INCAR / POSCAR / POTCAR / KPOINTS>
-#   vasp-test                        # 1 debug node; renders ./slurm_vasptest.sh
-#                                    # (the exact job), submits it, then writes
-#                                    # slurm_job.sh + INCAR.parallel from the run.
-#   vasp-test --debug-nodes 2        # use BOTH debug nodes (96 ranks, 48/node)
-#   vasp-test --prod-ranks 256       # size the production job for 256 ranks
-#
-# FLAGS
-#   --debug-nodes N   debug nodes to reserve for the benchmark (default 1;
-#                     2 -> 96 ranks across 2 nodes, 48 per node).
-#   --prod-ranks N    total MPI ranks to size the production job for
-#                     (default: auto = your account core cap).
+#   cd <dir with INCAR / POSCAR / POTCAR / KPOINTS>      # after dry-run + recommend
+#   vasp-test                        # renders ./slurm_vasptest.sh, submits it,
+#                                    # then scales + updates slurm.sh + report.out
 #
 #   Tunables (export before running):
-#     VASP_TEST_MINUTES=11          # length of the timed run (<= ~25 on debug)
+#     VASP_TEST_MINUTES=30          # length of the timed run (needs debug walltime)
+#     VASP_TEST_MAX_CORES=96        # cap on debug ranks (default: 2 x cores/node)
 #     VASP_EXE=vasp_std             # vasp_std | vasp_gam | vasp_ncl
 #     VASP_TEST_MEM_UTIL=0.80       # request memory so usage >= this fraction
 #     VASP_TEST_DEBUG_MARGIN_MB=16384  # memory kept free per debug/login node
-#     VASP_TEST_PROD_TIME=7-00:00:00   # --time of the production job
-#
-#   The advice is printed to the job's .out file (vasp_test-<jobid>.out) and
-#   saved as slurm_job.sh + INCAR.parallel in your submit directory.
 #
 # REQUIREMENTS
+#   - Run vasp-dry-run + vasp-recommend-slurm first (this needs slurm.sh + state).
 #   - SLURM job accounting (sacct/MaxRSS) enabled -> the memory is anchored to
 #     the measured peak. If it is off, it falls back to VASP's own memory table.
 ###############################################################################
@@ -67,7 +55,7 @@
 # --- Allow `vasp-test --help` to work outside of SLURM (handled in the parser
 #     below too; this early check keeps --help working before set -u) ---------
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    sed -n '2,63p' "${BASH_SOURCE[0]}" | grep -v '^#####' | sed 's/^# \{0,1\}//'
+    sed -n '2,52p' "${BASH_SOURCE[0]}" | grep -v '^#####' | sed 's/^# \{0,1\}//'
     exit 0
 fi
 
@@ -89,25 +77,28 @@ _wp_conf="${WOLFPACK_CLUSTER_CONF:-$HOME/.config/wolfpack-dft/cluster.conf}"
 # shellcheck source=/dev/null
 [[ -f "$_wp_conf" ]] && source "$_wp_conf"
 
-TEST_MINUTES="${VASP_TEST_MINUTES:-11}"
+TEST_MINUTES="${VASP_TEST_MINUTES:-30}"
 DEBUG_MARGIN_MB="${VASP_TEST_DEBUG_MARGIN_MB:-16384}"   # keep free on debug node
-MEM_UTIL="${VASP_TEST_MEM_UTIL:-0.80}"                  # request so use >= this frac
-DEBUG_NODES="${VASP_TEST_DEBUG_NODES:-1}"               # how many debug nodes to use
-PROD_RANKS="${VASP_TEST_PROD_RANKS:-0}"                 # 0 = auto (cap at max-cores)
 
-# Submit-side flags (the rendered job re-enters with no args, so on the job side
-# these stay at their env-provided values, which the wrapper exports).
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --debug-nodes) DEBUG_NODES="${2:?--debug-nodes needs a number}"; shift 2 ;;
-        --prod-ranks)  PROD_RANKS="${2:?--prod-ranks needs a number}"; shift 2 ;;
-        -h|--help)     sed -n '2,63p' "${BASH_SOURCE[0]}" | grep -v '^#####' | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,52p' "${BASH_SOURCE[0]}" | grep -v '^#####' | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "vasp-test: unknown option '$1' (try --help)" >&2; shift ;;
     esac
 done
 
-# Emit the resolved module-load command lines (baked into the rendered job
-# script; the body skips its own loading when WP_MODULES_PRELOADED is set).
+# --- Read the FIXED config from vasp-recommend (STAGE 2 of the pipeline) ---- #
+_wp_state="${WOLFPACK_STATE:-.wolfpack/state.env}"
+# shellcheck source=/dev/null
+[[ -f "$_wp_state" ]] && source "$_wp_state"
+FIX_KPAR="${kpar:-1}"; FIX_NCORE="${ncore:-1}"; FIX_NPAR="${npar:-1}"
+FIX_NSIM="${nsim:-4}"; PROD_RANKS="${ranks:-0}"
+PROD_PARTITION="${prod_partition:-${WP_MAIN_PARTITION:-main}}"
+PROD_CPN="${prod_cpn:-${WP_MAIN_CPUS_PER_NODE:-256}}"
+PROD_NODE_MEM="${node_mem_mb:-${WP_MAIN_MEM_PER_NODE_MB:-256000}}"
+MEM_UTIL="${mem_util:-${VASP_TEST_MEM_UTIL:-0.80}}"
+
+# Emit the resolved module-load command lines (baked into the rendered job).
 _wp_module_block() {
     if [[ -n "${WP_VASP_MODULES:-}" ]]; then
         local cmd="${WP_MODULE_CMD:-ml}"
@@ -116,61 +107,73 @@ _wp_module_block() {
         fi
         if [[ "$cmd" == "module" ]]; then echo "module load ${WP_VASP_MODULES}"
         else echo "ml ${WP_VASP_MODULES}"; fi
-    else                                   # built-in NLHPC default
+    else                                   # built-in example default
         echo "ml purge"
         echo "ml gcc/14.2.0-zen4-y"
         echo "ml vasp/6.4.3-mpi-openmp-h5-zen4-c"
     fi
 }
 
-# --- Submit side: render a self-contained job script and submit it --------- #
+# --- Submit side: fit the FIXED config into the debug partition + submit --- #
 if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     if ! command -v sbatch >/dev/null 2>&1; then
         echo "ERROR: sbatch not found. Run on a cluster login node." >&2; exit 1
     fi
+    if [[ "${stage:-}" != "recommend" || ! -f slurm.sh ]]; then
+        echo "ERROR: no recommendation found. Run the pipeline IN ORDER:" >&2
+        echo "         vasp-dry-run  ->  vasp-recommend-slurm  ->  vasp-test" >&2
+        exit 2
+    fi
     part="${WP_DEBUG_PARTITION:-debug}"
     cpn="${WP_DEBUG_CPUS_PER_NODE:-48}"
-    nodes="$DEBUG_NODES"; (( nodes < 1 )) && nodes=1
-    n=$(( cpn * nodes ))                                  # total ranks
     memnode="${WP_DEBUG_MEM_PER_NODE_MB:-360000}"
-    # Leave a reserve free on each debug node (it doubles as the login node).
-    usable=$(( memnode - DEBUG_MARGIN_MB )); (( usable < cpn )) && usable=$memnode
-    mempc=$(( usable / cpn )); (( mempc < 100 )) && mempc=100
+    # Largest rank count that (a) keeps KPAR x NCORE fixed, (b) fits in the
+    # debug partition (up to BOTH debug nodes), and (c) does not exceed prod.
+    max_test="${VASP_TEST_MAX_CORES:-$(( cpn * 2 ))}"
+    unit=$(( FIX_KPAR * FIX_NCORE )); (( unit < 1 )) && unit=1
+    tr=$(( (max_test / unit) * unit )); (( tr < unit )) && tr=$unit
+    if (( PROD_RANKS > 0 && tr > PROD_RANKS )); then
+        tr=$(( (PROD_RANKS / unit) * unit )); (( tr < unit )) && tr=$unit
+    fi
+    tnodes=$(( (tr + cpn - 1) / cpn )); (( tnodes < 1 )) && tnodes=1
+    tntpn=$(( (tr + tnodes - 1) / tnodes ))
+    usable=$(( memnode - DEBUG_MARGIN_MB )); (( usable < 1 )) && usable=$memnode
+    mempc=$(( usable / tntpn )); (( mempc < 100 )) && mempc=100
+    wmin=$(( TEST_MINUTES + 8 )); ttime=$(printf '%02d:%02d:00' $((wmin/60)) $((wmin%60)))
     self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+    mkdir -p .wolfpack
     job="$PWD/slurm_vasptest.sh"
     {
         echo "#!/bin/bash"
         echo "#SBATCH --job-name=vasp_test"
         echo "#SBATCH --partition=${part}"
-        echo "#SBATCH --nodes=${nodes}"
-        echo "#SBATCH --ntasks=${n}"
-        echo "#SBATCH --ntasks-per-node=${cpn}"
+        echo "#SBATCH --nodes=${tnodes}"
+        echo "#SBATCH --ntasks=${tr}"
+        echo "#SBATCH --ntasks-per-node=${tntpn}"
         echo "#SBATCH --cpus-per-task=1"
         echo "#SBATCH --mem-per-cpu=${mempc}"
-        echo "#SBATCH --time=00:18:00"
+        echo "#SBATCH --time=${ttime}"
         if [[ -n "${WP_EMAIL:-}" ]]; then
             echo "#SBATCH --mail-user=${WP_EMAIL}"
             echo "#SBATCH --mail-type=ALL"
         fi
-        echo "#SBATCH --output=vasp_test-%j.out"
-        echo "#SBATCH --error=vasp_test-%j.err"
+        echo "#SBATCH --output=.wolfpack/vasptest-%j.out"
+        echo "#SBATCH --error=.wolfpack/vasptest-%j.err"
         echo ""
-        echo "# Generated by vasp-test on $(date -Iseconds) -- the exact job submitted."
-        echo 'cd "$SLURM_SUBMIT_DIR"'
+        echo "# Generated by vasp-test on $(date -Iseconds) -- STAGE 3/3 (exact job)."
+        echo 'cd "$SLURM_SUBMIT_DIR" || exit 1'
         echo ""
         echo "# --- modules (resolved from your cluster profile) ---"
         _wp_module_block
         echo ""
-        echo "# Run the benchmark + analysis body of the installed vasp-test."
         echo "export VASP_TEST_MINUTES='${TEST_MINUTES}'"
-        echo "export VASP_TEST_PROD_RANKS='${PROD_RANKS}'"
-        echo "export VASP_TEST_DEBUG_NODES='${nodes}'"
         echo "export WP_MODULES_PRELOADED=1"
         echo "exec '${self}'"
     } > "$job"
     chmod +x "$job"
-    echo "Wrote job script : $job" >&2
-    echo "Submitting ${TEST_MINUTES}-min VASP benchmark: partition '${part}', ${nodes} node(s) x ${cpn} = ${n} ranks, ${mempc} MB/cpu (${DEBUG_MARGIN_MB} MB/node reserved) ..." >&2
+    echo "STAGE 3: benchmarking the FIXED config (KPAR=${FIX_KPAR} NCORE=${FIX_NCORE} NSIM=${FIX_NSIM})" >&2
+    echo "         at ${tr} ranks on '${part}' (${tnodes} node(s) x ${tntpn}, ${mempc} MB/cpu," >&2
+    echo "         ${DEBUG_MARGIN_MB} MB/node reserved, ${TEST_MINUTES} min); production target ${PROD_RANKS} ranks." >&2
     exec sbatch "$job"
 fi
 
@@ -207,11 +210,16 @@ mkdir -p "$RUNDIR"
 cp -f "$SUBMIT_DIR"/INCAR "$SUBMIT_DIR"/POSCAR "$SUBMIT_DIR"/POTCAR "$SUBMIT_DIR"/KPOINTS "$RUNDIR/"
 cd "$RUNDIR" || { echo "Cannot enter run dir $RUNDIR" >&2; exit 1; }
 
-# Make the test cheap on I/O: never write WAVECAR/CHGCAR during the benchmark.
-# (Append-and-let-VASP-take-the-last-value; we do not alter your real INCAR.)
+# Pin the benchmark to the EXACT parallel config vasp-recommend chose (so we
+# validate that fixed layout), and skip WAVECAR/CHGCAR I/O. Appended values win
+# in VASP, so we never alter your real INCAR's physics.
+TEST_NPAR=$(( NTASKS / (FIX_KPAR * FIX_NCORE) )); (( TEST_NPAR < 1 )) && TEST_NPAR=1
 {
     echo ""
     echo "# ---- appended by vasp-test (benchmark only; harmless duplicates) ----"
+    echo "KPAR   = ${FIX_KPAR}"
+    echo "NCORE  = ${FIX_NCORE}"
+    echo "NSIM   = ${FIX_NSIM}"
     echo "LWAVE  = .FALSE."
     echo "LCHARG = .FALSE."
 } >> INCAR
@@ -220,7 +228,8 @@ hdr "VASP RESOURCE BENCHMARK  (${PARTITION}, ${NTASKS} ranks, ${TEST_MINUTES} mi
 echo "  job id        : $SLURM_JOB_ID"
 echo "  run directory : $RUNDIR"
 echo "  executable    : $VASP_EXE"
-echo "  inputs tested : your current INCAR parallel settings (KPAR/NCORE if set)"
+echo "  testing config: KPAR=${FIX_KPAR} NCORE=${FIX_NCORE} NPAR=${TEST_NPAR} NSIM=${FIX_NSIM}  (FIXED by vasp-recommend)"
+echo "  production goal: ${PROD_RANKS} ranks on '${PROD_PARTITION}'"
 echo "  start         : $(date)"
 
 # --------------------------------------------------------------------------- #
@@ -237,7 +246,7 @@ if [[ -z "${WP_MODULES_PRELOADED:-}" ]]; then
         # shellcheck disable=SC2086
         if [[ "$_wpcmd" == "module" ]]; then module load $WP_VASP_MODULES
         else ml $WP_VASP_MODULES; fi
-    else                                   # built-in NLHPC default
+    else                                   # built-in example default
         ml purge                              2>/dev/null || true
         ml gcc/14.2.0-zen4-y                  2>/dev/null || true
         ml vasp/6.4.3-mpi-openmp-h5-zen4-c    2>/dev/null || true
@@ -356,9 +365,9 @@ if posq "$cpu_eff"; then
 fi
 
 # --------------------------------------------------------------------------- #
-# 5. Build the PRODUCTION recommendation FROM THE MEASUREMENT
-#    (memory anchored to the measured MaxRSS, layout from the run, cluster
-#    policies applied -- NOT a re-run of vasp-recommend's model.)
+# 5. Scale the MEASUREMENT to the production config, update slurm.sh, report
+#    (memory anchored to measured MaxRSS at the test scale, then projected to
+#    the FIXED production rank count; cluster 80% rule applied.)
 # --------------------------------------------------------------------------- #
 PY="$(command -v python3 || command -v python || true)"
 SELF_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")"
@@ -370,24 +379,8 @@ for cand in "${VASP_TEST_RECOMMEND:-}" \
     [[ -n "$cand" && -f "$cand" ]] && { HELPER="$cand"; break; }
 done
 
-if [[ -z "$PY" || -z "$HELPER" ]]; then
-    hdr "NEXT STEP (could not auto-generate the recommendation)"
-    echo "  python3 and/or the helper (vasp_test_recommend.py) were not found."
-    echo "  Your MEASURED peak memory was ${maxrss_mb} MB/rank on ${NTASKS} ranks."
-    echo "  Size production from that: request MaxRSS / ${MEM_UTIL} per rank."
-    echo "  Benchmark outputs kept in: $RUNDIR"
-    exit 0
-fi
-
-MAIN_PART="${WP_MAIN_PARTITION:-main}"
-MAIN_CPN="${WP_MAIN_CPUS_PER_NODE:-256}"
-MAIN_MEM="${WP_MAIN_MEM_PER_NODE_MB:-$(( MAIN_CPN * 2000 ))}"
-MAXCORES="${WP_MAX_CORES:-$MAIN_CPN}"
-PROD_TIME="${VASP_TEST_PROD_TIME:-7-00:00:00}"
-MODS="$(_wp_module_block)"
-
-# Sanitise the numeric metrics one more time (defensive: argparse needs clean
-# ints/floats, and a stray newline here would abort the whole recommendation).
+# Sanitise the numeric metrics (argparse needs clean ints/floats; a stray
+# newline here would abort the whole STAGE 3 step).
 maxrss_mb="${maxrss_mb//[!0-9.]/}"; maxrss_mb="${maxrss_mb:-0}"
 cpu_eff="${cpu_eff//[!0-9.]/}"; cpu_eff="${cpu_eff:-0}"
 avg_loop="${avg_loop//[!0-9.]/}"; avg_loop="${avg_loop:-0}"
@@ -395,27 +388,41 @@ nscf="${nscf//[!0-9]/}"; nscf="${nscf:-0}"
 wall="${wall//[!0-9]/}"; wall="${wall:-0}"
 NTASKS="${NTASKS//[!0-9]/}"; NTASKS="${NTASKS:-1}"
 
+if [[ -z "$PY" || -z "$HELPER" ]]; then
+    hdr "DONE (could not auto-update slurm.sh)"
+    echo "  python3 and/or vasp_test_recommend.py were not found."
+    echo "  MEASURED peak memory: ${maxrss_mb} MB/rank at ${NTASKS} ranks."
+    echo "  Size production by hand: at ${PROD_RANKS} ranks request about"
+    echo "  (measured x ${NTASKS}/${PROD_RANKS}) / ${MEM_UTIL} MB per rank."
+    echo "  Benchmark outputs kept in: $RUNDIR"
+    exit 0
+fi
+
 if "$PY" "$HELPER" "$OUTCAR" \
     --maxrss-mb "$maxrss_mb" --ntasks-test "$NTASKS" \
-    --avg-loop "$avg_loop" --cpu-eff "$cpu_eff" --nscf "$nscf" --wall "$wall" \
-    --partition main --slurm-partition "$MAIN_PART" \
-    --cpus-per-node "$MAIN_CPN" --node-mem-mb "$MAIN_MEM" --max-cores "$MAXCORES" \
-    --mem-util "$MEM_UTIL" --debug-margin-mb "$DEBUG_MARGIN_MB" \
-    --prod-ranks "$PROD_RANKS" \
-    --email "$EMAIL" --job-name "$JOBNAME" --exe "$VASP_EXE" --time "$PROD_TIME" \
-    --modules "$MODS" --extra-env "${WP_EXTRA_ENV:-}" \
-    --write-slurm "$SUBMIT_DIR/slurm_job.sh" --write-incar "$SUBMIT_DIR/INCAR.parallel"
+    --test-kpar "$FIX_KPAR" --test-ncore "$FIX_NCORE" --test-npar "$TEST_NPAR" \
+    --prod-ranks "$PROD_RANKS" --prod-kpar "$FIX_KPAR" --prod-ncore "$FIX_NCORE" \
+    --prod-npar "$FIX_NPAR" --prod-nsim "$FIX_NSIM" \
+    --prod-partition "$PROD_PARTITION" --cpus-per-node "$PROD_CPN" \
+    --node-mem-mb "$PROD_NODE_MEM" --mem-util "$MEM_UTIL" \
+    --cpu-eff "$cpu_eff" --avg-loop "$avg_loop" --nscf "$nscf" --wall "$wall" \
+    --update-slurm "$SUBMIT_DIR/slurm.sh" --report "$SUBMIT_DIR/report.out"
 then
-    hdr "DONE"
-    echo "  Benchmark inputs/outputs kept in: $RUNDIR"
-    echo "  Production files written to your submit directory:"
-    echo "    $SUBMIT_DIR/slurm_job.sh     (sbatch this to run the real calculation)"
-    echo "    $SUBMIT_DIR/INCAR.parallel   (merge KPAR/NCORE/NSIM into your INCAR)"
+    # Tidy: keep the folder clean -- the benchmark run dir lives under .wolfpack.
+    if [[ -d "$RUNDIR" ]]; then
+        mkdir -p "$SUBMIT_DIR/.wolfpack"
+        cp -f "$OUTCAR" "$SUBMIT_DIR/.wolfpack/vasptest_OUTCAR" 2>/dev/null || true
+        rm -rf "$RUNDIR"
+    fi
+    { echo 'stage="test"'; } >> "$SUBMIT_DIR/.wolfpack/state.env" 2>/dev/null || true
+    hdr "DONE -- pipeline complete"
+    echo "  Production job ready: $SUBMIT_DIR/slurm.sh"
+    echo "  (memory updated from this benchmark; merge KPAR/NCORE/NSIM into INCAR)"
+    echo "  Full report        : $SUBMIT_DIR/report.out"
 else
-    hdr "DONE (recommendation step failed -- see the error above)"
-    echo "  The benchmark itself succeeded; only the recommendation helper failed."
-    echo "  Your MEASURED peak memory was ${maxrss_mb} MB/rank on ${NTASKS} ranks."
-    echo "  Size production from that: request MaxRSS / ${MEM_UTIL} per rank."
-    echo "  Benchmark inputs/outputs kept in: $RUNDIR"
+    hdr "DONE (scaling step failed -- see the error above)"
+    echo "  The benchmark succeeded; only the scaling/update step failed."
+    echo "  MEASURED peak memory: ${maxrss_mb} MB/rank at ${NTASKS} ranks."
+    echo "  Benchmark outputs kept in: $RUNDIR"
 fi
 echo "  end: $(date)"

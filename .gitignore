@@ -92,7 +92,13 @@ Plots/
 vasp_test_*/
 # occupations table written by collect-u-data:
 U_data.dat
-# SLURM script + INCAR snippet written by vasp-recommend-slurm / vasp-test:
+# hidden pipeline state / intermediates (dry-run OUTCAR, state.env, job logs):
+.wolfpack/
+# combined pipeline report:
+report.out
+# production SLURM script written by vasp-recommend-slurm / updated by vasp-test:
+slurm.sh
+# legacy names (older versions wrote these):
 slurm_job.sh
 slurm_job_*.sh
 INCAR.parallel

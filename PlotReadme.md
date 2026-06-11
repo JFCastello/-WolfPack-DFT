@@ -1,10 +1,10 @@
 # vasp-plot-fatbandsdos
 
 Publication-ready **fat-band + DOS** figures from a standard VASP run. The band
-panel encodes projection weight as **marker opacity** (RGB/duo) or **circle area**
-(stacked); the DOS panel shares the energy axis and is projected onto the same
-atom/orbital groups. Energies are referenced to E_F = 0; spin polarisation
-and SOC are detected automatically.
+panel encodes projection weight as **marker opacity** (rgb/duo/one_orbital/cmyk)
+or **circle area** (stacked); the DOS panel shares the energy axis and is
+projected onto the same atom/orbital groups. Energies are referenced to
+E_F = 0; spin polarisation and SOC are detected automatically.
 
 ---
 
@@ -56,15 +56,23 @@ case-insensitive and accept `-`/space for `_` (e.g. `One_Orbital`, `one-orbital`
 | `one_orbital` | exactly 1 | **pure-blue** circles; opacity = w_group / w_total (the duo/rgb opacity law with a single channel) |
 | `duo` | exactly 2 | gradient between two vivid colours; opacity = total weight |
 | `rgb` | 1–3 | additive RGB: colour = relative mix of groups; opacity = total weight |
+| `cmyk` | exactly 4 | subtractive **CMYK** mix (group 0→cyan, 1→magenta, 2→yellow, 3→black); opacity = total weight. A 4-orbital generalisation of `rgb` |
 | `stacked` | any number | sumo-style circles; area proportional to weight² |
 
 ```bash
 vasp-plot-fatbandsdos ... --method plain        # no projection; black k-point dots
 vasp-plot-fatbandsdos ... --method one_orbital  # 1 group -> pure-blue circles
-vasp-plot-fatbandsdos ... --method rgb          # up to 3 groups -> R / G / B
 vasp-plot-fatbandsdos ... --method duo          # exactly 2 groups
+vasp-plot-fatbandsdos ... --method rgb          # up to 3 groups -> R / G / B
+vasp-plot-fatbandsdos ... --method cmyk         # exactly 4 groups -> C / M / Y / K
 vasp-plot-fatbandsdos ... --method stacked      # any number of groups
 ```
+
+The **`cmyk`** colour at each point is the CMYK→RGB conversion of the four
+normalised group weights `(C,M,Y,K)`:
+`R=(1-C)(1-K), G=(1-M)(1-K), B=(1-Y)(1-K)`. A band dominated by group 0 shows
+cyan, group 1 magenta, group 2 yellow, group 3 black; opacity still tracks the
+combined weight of the four groups relative to the total.
 
 ### Auto-pick projections over an energy window (`--auto-projections N`)
 
@@ -73,9 +81,10 @@ Instead of giving `--projections`, let the tool choose the `N` most-important
 **projected DOS integrated over the window** (a proper states integral, summed
 over spin) — a faithful, reproducible measure of which orbitals dominate the
 range. For the fixed-count methods `N` is implied (`one_orbital`→1, `duo`→2,
-`rgb`→3); `stacked` takes the `N` you pass. If the cell has fewer distinct
-elements than `N`, selection falls back to inequivalent **Wyckoff sites** of the
-same element (`Pt1-d, Pt2-d, …`), always in descending contribution order.
+`rgb`→3, `cmyk`→4); `stacked` takes the `N` you pass. If the cell has fewer
+distinct elements than `N`, selection falls back to inequivalent **Wyckoff
+sites** of the same element (`Pt1-d, Pt2-d, …`), always in descending
+contribution order.
 
 ```bash
 # the dominant orbital character between -3 and +3 eV, as pure-blue fat bands:
@@ -89,19 +98,32 @@ vasp-plot-fatbandsdos --root . --method rgb --auto-projections 3 --emin -6 --ema
 `--name BASENAME` controls the output filename written under `Plots/`
 (default `fatbands_dos`).
 
-### `vasp-quick-plots` — one figure per method, automatically
+### `vasp-quick-plots` — one figure per method, organised into folders
 
 ```bash
 conda activate wolfpack-dft
 vasp-quick-plots --emin -6 --emax 6 --title "CuVS_3"
-#   -> Plots/{plain,one_orbital,duo,rgb,stacked}.{png,pdf}
-vasp-quick-plots --methods plain,one_orbital,rgb   # subset
-vasp-quick-plots --stacked-n 5                     # 5 units in the stacked plot
+vasp-quick-plots --methods plain,rgb,cmyk          # subset
+vasp-quick-plots --stacked-n 6                      # 6 units in the stacked plot
 ```
 
 `vasp-quick-plots` runs `vasp-plot-fatbandsdos` once per method with the right
-`--auto-projections` count and a distinct `--name`, and keeps going if one
-method fails.
+`--auto-projections` count, writing each method into its own numbered sub-folder
+of `Plots/` (and keeps going if one method fails):
+
+```
+Plots/
+  0_Plain/     1_ONE/     2_DUO/     3_RGB/     4_CMYK/     5_Stacked/
+```
+
+`5_Stacked` auto-picks the **5** most-contributing units (override `--stacked-n`).
+
+**Spin routing (ISPIN=2):**
+
+- `--spin both` → every folder gets separate **spin-up** and **spin-down** plots
+  (`rgb_up`, `rgb_down`, …). `0_Plain` **additionally** gets the overlaid
+  blue/orange plain plot (`plain_overlay`).
+- `--spin up` / `--spin down` → every folder gets only that one channel.
 
 ---
 
@@ -155,21 +177,23 @@ With no `--title` the reduced formula is used; `--no-title` suppresses it.
 |------|---------|-------------|
 | `--root PATH` | `.` | calculation root containing `Scf/ Bands/ Dos/` |
 | `--list` | – | print species / atom tokens / orbitals, then exit |
-| **`--method {plain,one_orbital,duo,rgb,stacked}`** | **(REQUIRED)** | projection method (see §3) |
+| **`--method {plain,one_orbital,duo,rgb,cmyk,stacked}`** | **(REQUIRED)** | projection method (see §3) |
 | `--projections "..."` | auto (one group/element) | atom+orbital groups (see §4) |
 | `--auto-projections N` | `0` (off) | auto-pick the top-N `(element, l)` units over the window (see §3) |
 | `--name BASENAME` | `fatbands_dos` | output base filename written under `Plots/` |
+| `--subdir NAME` | – | write into `Plots/NAME/` (used by `vasp-quick-plots`) |
 | `--spin {both,up,down}` | `both` | ISPIN=2: choose spin channel(s). Ignored for ISPIN=1 (one channel; see below). |
+| `--no-overlay-plain` | (overlay on) | for `--spin both`, do **not** also write the overlaid blue/orange plain plot |
 | `--title "..."` | reduced formula | journal-style title (see §5) |
 | `--no-title` | – | suppress the title |
 | `--emin` / `--emax` | auto-fit to bands | energy window (eV, rel. E_F); also bounds `--auto-projections` |
 | `--group {symmetry,formula,element}` | `symmetry` | how S1/S2/… map to atoms |
 | `--symprec F` | `0.01` Å | spglib tolerance for `--group symmetry` |
 | `--markers N` | `0` (one per k-pt) | subsample markers on a dense k-path |
-| `--marker-size F` | `3.0` pt² | fixed circle area (rgb/duo/one_orbital); weight → opacity |
+| `--marker-size F` | `3.0` pt² | fixed circle area (rgb/duo/one_orbital/cmyk); weight → opacity |
 | `--plain-marker-size F` | `4.0` pt² | black k-point circle area (plain) |
-| `--alpha-min F` | `0.06` | min opacity at zero weight (rgb/duo/one_orbital) |
-| `--alpha-max F` | `1.0` | max opacity at full weight (rgb/duo/one_orbital) |
+| `--alpha-min F` | `0.06` | min opacity at zero weight (rgb/duo/one_orbital/cmyk) |
+| `--alpha-max F` | `1.0` | max opacity at full weight (rgb/duo/one_orbital/cmyk) |
 | `--circle-size F` | `45` | circle area scale factor (stacked) |
 | `--pickle` | off | also save the figure as `.fig.pkl` for later editing |
 | `--formats png,pdf` | `png,pdf` | comma-separated output formats |
@@ -189,24 +213,32 @@ The plotter detects ISPIN automatically:
 - **ISPIN = 1** (non spin-polarised): one channel. `--spin` is meaningless and
   is ignored (a single set of bands/DOS is drawn); passing `--spin up/down`
   prints a harmless note rather than an error.
-- **ISPIN = 2** (collinear spin): `--spin both` overlays both channels;
-  `--spin up` or `--spin down` isolates one.
+- **ISPIN = 2** (collinear spin):
+  - `--spin up` / `--spin down` draws that one channel with the **standard
+    circles** (normal colour/opacity, no special markers or edges), written as
+    `<name>_up` / `<name>_down`.
+  - `--spin both` writes **three** figures: the spin-up plot, the spin-down plot
+    (each in the chosen method), **and** a dedicated **overlaid plain plot**
+    `<name>_overlay`.
 - **ISPIN ≥ 3** (non-collinear / spinor, 4 components): not implemented — the
   tool stops with a clear message instead of producing a wrong figure.
 
-**Both-spin marker styling.** When both channels are drawn together in
-`plain`, `one_orbital`, `duo` or `rgb`, circles are replaced by **very small
-triangles** so the channels never sit ambiguously on top of one another:
-spin-up = ▲ (up-triangle) with a **pure-cyan** edge, spin-down = ▼
-(down-triangle) with a **pure-magenta** edge. The face still carries the
-projection colour/opacity; the coloured edge marks the spin even where the
-weight (and thus the face) is faint. In `plain` mode the markers use an
-intermediate opacity so the dispersion stays readable.
+> The previous cyan/magenta up/down **triangle** styling has been **removed**;
+> the two channels are never overlaid in a projected figure any more.
 
-**Stacked + both spins → two figures.** `--method stacked` overlays poorly with
-two spin channels, so when `--spin both` it writes **one figure per spin**, with
-the channel in the filename: `<name>_up.{png,pdf}` and `<name>_down.{png,pdf}`
-(the title is tagged ↑ / ↓ too).
+**The overlaid plain plot (`--spin both`).** Both channels in one *plain* plot
+(no projections): spin-up bands are **pure-RGB blue**, spin-down **vivid
+orange**, drawn as the usual slightly-translucent plain circles. The single grey
+backbone is replaced by **two per-spin backbones** — very thin, **dashed**,
+highly transparent, pale blue (up) and pale orange (down). The DOS panel mirrors
+the two channels (up positive/blue, down negative/orange).
+
+**Stacked + both spins.** `--method stacked --spin both` follows the same rule:
+one stacked figure per spin (`<name>_up`, `<name>_down`) plus the overlaid plain
+plot. The stacked mode faithfully reproduces **sumo**'s algorithm (per-point
+weights normalised over the selected groups, spline-interpolated bands, circle
+**area = `circle_size · w²`**, sumo colour cycle, weights below the projection
+cutoff dropped).
 
 ---
 

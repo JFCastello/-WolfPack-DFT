@@ -18,7 +18,7 @@ from pymatgen.io.vasp.outputs import BSVasprun
 
 from .config import (BANDS_DIR, DEFAULT_METHOD, DEFAULT_OUT_NAME,
                      DEFAULT_PROJECTIONS, DOS_DIR, DPI, EMAX, EMIN, FIG_H,
-                     FIG_W, FONT_FAMILY, GROUP_MODE, KPT_LABEL_SIZE, MARKER_SIZE,
+                     FIG_W, FONT_FAMILY, GROUP_MODE, MARKER_SIZE,
                      MARKER_TARGET, METHOD_N_UNITS, METHODS, OUT_DIR,
                      OUT_FORMATS, PLAIN_MARKER_SIZE, SCF_DIR, SHOW_TITLE,
                      SYMPREC, ALPHA_MAX, ALPHA_MIN, STACKED_CIRCLE_SIZE,
@@ -44,6 +44,7 @@ except Exception:                                       # pragma: no cover
 # Configuration, loading, public API
 # --------------------------------------------------------------------------- #
 def _make_cfg(**overrides):
+    """Build a config namespace from defaults + overrides, validating method/group."""
     cfg = argparse.Namespace(
         root=Path("."), projections=None, method=DEFAULT_METHOD, spin="both",
         title=None, show_title=SHOW_TITLE, emin=None, emax=None,
@@ -51,7 +52,8 @@ def _make_cfg(**overrides):
         plain_marker_size=PLAIN_MARKER_SIZE,
         alpha_min=ALPHA_MIN, alpha_max=ALPHA_MAX,
         circle_size=STACKED_CIRCLE_SIZE,
-        auto_projections=0, name=DEFAULT_OUT_NAME,
+        auto_projections=0, name=DEFAULT_OUT_NAME, subdir=None,
+        overlay_plain=True,
         group=GROUP_MODE, symprec=SYMPREC,
         smear=None, dpi=DPI, figw=FIG_W, figh=FIG_H,
         font=FONT_FAMILY, formats=",".join(OUT_FORMATS), pickle=False,
@@ -74,6 +76,7 @@ def _resolve_spins_value(spin, is_spin):
     # ISPIN=1 (non spin-polarised): there is only one channel, so --spin is
     # meaningless. Ignore it (warn only if the user explicitly asked for a
     # specific channel) and always plot the single set of bands.
+    """Resolve --spin + ISPIN into the spin list and a both-channels flag."""
     if not is_spin:
         if spin in ("up", "down"):
             warnings.warn(
@@ -86,6 +89,28 @@ def _resolve_spins_value(spin, is_spin):
     if spin == "down":
         return [Spin.down], False
     return [Spin.up, Spin.down], True
+
+
+def _spin_jobs(cfg, bands_data, spins, show_both):
+    """Figures to render, as (spins, filename-suffix, title-note, overlay_plain).
+
+    ISPIN=1            -> one plot (no suffix).
+    ISPIN=2 --spin up  -> the spin-up channel  (suffix "up").
+    ISPIN=2 --spin down-> the spin-down channel (suffix "down").
+    ISPIN=2 --spin both-> spin-up + spin-down PLUS the overlaid blue/orange plain
+                          plot (suffix "overlay"), unless cfg.overlay_plain=False.
+    """
+    if not bands_data["is_spin"]:
+        return [(spins, "", None, False)]
+    if cfg.spin == "up":
+        return [([Spin.up], "up", r"\uparrow", False)]
+    if cfg.spin == "down":
+        return [([Spin.down], "down", r"\downarrow", False)]
+    jobs = [([Spin.up], "up", r"\uparrow", False),
+            ([Spin.down], "down", r"\downarrow", False)]
+    if getattr(cfg, "overlay_plain", True):
+        jobs.append(([Spin.up, Spin.down], "overlay", r"\uparrow\!\downarrow", True))
+    return jobs
 
 
 def _resolve_groups(cfg, bands_data, dos_data, structure, n_orb, grouping, efermi):
@@ -153,6 +178,11 @@ def _resolve_groups(cfg, bands_data, dos_data, structure, n_orb, grouping, eferm
                 f"--method rgb encodes at most 3 groups, but this cell has "
                 f"{n} elements ({els}). Give 3 groups explicitly, use "
                 f"--auto-projections 3, or --method stacked. Run --list.")
+        if method == "cmyk" and n != 4:
+            raise ValueError(
+                f"--method cmyk needs exactly 4 groups, but auto-detection found "
+                f"{n} element(s) ({els}). Give 4 groups explicitly or use "
+                f"--auto-projections 4.")
         if method == "duo" and n != 2:
             raise ValueError(
                 f"--method duo needs exactly 2 groups, but auto-detection found "
@@ -273,8 +303,11 @@ def generate(root=".", *, return_axes=False, return_data=False, **kwargs):
     """Build the figure and return it (for use from another script)."""
     cfg = _make_cfg(root=root, **kwargs)
     bands_data, dos_data, groups, spins, show_both, gap = load_all(cfg)
-    fig, axes = build_figure(bands_data, dos_data, groups, cfg, spins, show_both,
-                             gap=gap)
+    job_spins, _suffix, note, overlay = _spin_jobs(cfg, bands_data, spins,
+                                                   show_both)[0]
+    fig, axes = build_figure(bands_data, dos_data, groups, cfg, job_spins,
+                             show_both=overlay, gap=gap, spin_note=note,
+                             overlay_plain=overlay)
     result = [fig]
     if return_axes:
         result.append(axes)
@@ -287,6 +320,7 @@ def generate(root=".", *, return_axes=False, return_data=False, **kwargs):
 # Discovery (--list)
 # --------------------------------------------------------------------------- #
 def list_structure(bands_dir: Path, group_mode=GROUP_MODE, symprec=SYMPREC):
+    """Print species, site grouping, atom tokens and orbitals for --list."""
     vr = BSVasprun(str(bands_dir / "vasprun.xml"), parse_projected_eigen=True)
     bs = vr.get_band_structure(kpoints_filename=str(bands_dir / "KPOINTS"),
                                line_mode=True, efermi="smart")
@@ -376,6 +410,7 @@ def list_structure(bands_dir: Path, group_mode=GROUP_MODE, symprec=SYMPREC):
 # CLI
 # --------------------------------------------------------------------------- #
 def parse_args(argv=None):
+    """Parse the vasp-plot-fatbandsdos command-line arguments."""
     p = argparse.ArgumentParser(
         prog="vasp-plot-fatbandsdos",
         description="Publication-ready fat-band + DOS plot from a VASP folder.",
@@ -393,15 +428,23 @@ def parse_args(argv=None):
     p.add_argument("--list", action="store_true",
                    help="Print species, per-element atom tokens and orbitals, then exit.")
     p.add_argument("--method", required=True,
-                   help="REQUIRED method: plain | one_orbital | duo | rgb | "
-                        "stacked. 'plain': no projection (pale backbone + black "
+                   help="REQUIRED method: plain | one_orbital | duo | rgb | cmyk "
+                        "| stacked. 'plain': no projection (pale backbone + black "
                         "k-point dots). 'one_orbital': 1 group -> pure-blue "
                         "circles (opacity=weight). 'duo': 2 groups -> two-colour "
-                        "gradient. 'rgb': up to 3 -> red/green/blue. 'stacked': "
-                        "any number, sumo circles (area ~ weight).")
+                        "gradient. 'rgb': up to 3 -> red/green/blue. 'cmyk': "
+                        "exactly 4 -> CMYK colour mix. 'stacked': any number, "
+                        "sumo circles (area ~ weight).")
     p.add_argument("--projections", default=None,
                    help="Projection groups, e.g. \"(Cu-d),(V-d),(S-p)\". "
-                        "one_orbital: 1; duo: 2; rgb: 1-3; stacked: any.")
+                        "one_orbital: 1; duo: 2; rgb: 1-3; cmyk: 4; stacked: any.")
+    p.add_argument("--subdir", default=None,
+                   help="Optional sub-folder under <root>/Plots/ to write into "
+                        "(used by vasp-quick-plots to group outputs).")
+    p.add_argument("--no-overlay-plain", dest="overlay_plain",
+                   action="store_false",
+                   help="For ISPIN=2 --spin both, do NOT also write the overlaid "
+                        "blue/orange plain plot (it is written by default).")
     p.add_argument("--auto-projections", dest="auto_projections", type=int,
                    default=0, metavar="N",
                    help="Instead of --projections, auto-pick the N most-"
@@ -467,6 +510,7 @@ def parse_args(argv=None):
 
 
 def main(argv=None):
+    """CLI entry point: read a VASP folder and render the requested figure(s)."""
     cfg = parse_args(argv)
     cfg.verbose = True
 
@@ -486,27 +530,29 @@ def main(argv=None):
         sys.exit(f"ERROR: {exc}")
 
     out_dir = root / OUT_DIR
+    if getattr(cfg, "subdir", None):
+        out_dir = out_dir / cfg.subdir
     out_dir.mkdir(parents=True, exist_ok=True)
     name = cfg.name or DEFAULT_OUT_NAME
     formats = [f.strip().lower() for f in cfg.formats.split(",") if f.strip()]
     import matplotlib.pyplot as plt
 
-    # The 'stacked' method overlays both spins poorly, so when both channels are
-    # requested we render ONE figure per spin and tag the spin in the filename.
-    if cfg.method == "stacked" and show_both:
-        jobs = [([Spin.up], "up", r"\uparrow"), ([Spin.down], "down", r"\downarrow")]
-    else:
-        jobs = [(spins, "", None)]
+    # --spin both renders the spin-up plot, the spin-down plot, and (unless
+    # disabled) the overlaid blue/orange plain plot; ISPIN=1 / single-spin
+    # selections render one figure.
+    jobs = _spin_jobs(cfg, bands_data, spins, show_both)
 
     written = []
-    for job_spins, suffix, note in jobs:
+    for job_spins, suffix, note, overlay in jobs:
         base = f"{name}_{suffix}" if suffix else name
-        print(f"[4/4] Rendering figure (method={cfg.method}, {len(groups)} group(s), "
+        what = "overlay plain" if overlay else cfg.method
+        print(f"[4/4] Rendering figure (method={what}, "
+              f"{0 if overlay else len(groups)} group(s), "
               f"spin={suffix or cfg.spin}, "
               f"{len(bands_data['segments'])} k-path panel(s)) -> {base} ...")
         fig, _axes = build_figure(bands_data, dos_data, groups, cfg, job_spins,
-                                  False if suffix else show_both, gap=gap,
-                                  spin_note=note)
+                                  show_both=overlay, gap=gap, spin_note=note,
+                                  overlay_plain=overlay)
         for fmt in formats:
             path = out_dir / f"{base}.{fmt}"
             fig.savefig(path, dpi=cfg.dpi, bbox_inches="tight")

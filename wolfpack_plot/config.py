@@ -31,8 +31,9 @@ DEFAULT_PROJECTIONS = ""
 #   "one_orbital" : exactly 1 group -> pure-blue circles; opacity = w/w_tot.
 #   "duo"         : exactly 2 groups -> two-colour gradient; opacity = total wt.
 #   "rgb"         : up to 3 groups  -> additive red/green/blue; opacity = total.
+#   "cmyk"        : exactly 4 groups -> CMYK colour mix (C/M/Y/K); opacity = total.
 #   "stacked"     : any number of groups -> sumo stacked circles (area ~ w^2).
-METHODS = ("plain", "one_orbital", "duo", "rgb", "stacked")
+METHODS = ("plain", "one_orbital", "duo", "rgb", "cmyk", "stacked")
 DEFAULT_METHOD = "rgb"
 
 _METHOD_ALIASES = {
@@ -41,6 +42,7 @@ _METHOD_ALIASES = {
     "one": "one_orbital", "single": "one_orbital", "mono": "one_orbital",
     "duo": "duo", "two": "duo",
     "rgb": "rgb",
+    "cmyk": "cmyk", "four": "cmyk", "quad": "cmyk",
     "stacked": "stacked", "stack": "stacked",
 }
 
@@ -60,15 +62,21 @@ def normalize_method(name: str) -> str:
 
 # How many projection groups each fixed-count method needs (None = any number).
 METHOD_N_UNITS = {
-    "plain": 0, "one_orbital": 1, "duo": 2, "rgb": 3, "stacked": None,
+    "plain": 0, "one_orbital": 1, "duo": 2, "rgb": 3, "cmyk": 4, "stacked": None,
 }
 
 # --------------------------------------------------------------------------- #
-# rgb / duo / one_orbital marker model
+# rgb / duo / one_orbital / cmyk marker model
 # --------------------------------------------------------------------------- #
 RGB_CHANNELS = ("#FF0000", "#00FF00", "#0000FF")   # pure additive R, G, B
 DUO_CHANNELS = ("#0066FF", "#FF8000")              # vivid blue <-> vivid orange
 ONE_ORBITAL_CHANNEL = ("#0000FF",)                 # pure blue (single channel)
+# CMYK: a 4-orbital generalisation of rgb using subtractive CMYK colour theory.
+# The four group weights become the C, M, Y, K fractions of a CMYK colour, which
+# is converted to RGB as R=(1-C)(1-K), G=(1-M)(1-K), B=(1-Y)(1-K). A point
+# dominated by group 0 -> cyan, group 1 -> magenta, group 2 -> yellow,
+# group 3 -> black. These per-channel legend swatches are those pure colours.
+CMYK_CHANNELS = ("#00FFFF", "#FF00FF", "#FFFF00", "#000000")  # C, M, Y, K
 
 MARKER_SIZE = 3.0          # fixed circle area (pt^2) for every point (tiny)
 ALPHA_MIN = 0.06           # opacity at S = 0  (faintest)
@@ -77,30 +85,34 @@ MARKER_TARGET = 0          # markers per k-path: 0 -> one per actual k-point
 PROJ_CUTOFF = 1e-3         # ignore points whose group weight is below this
 
 # --------------------------------------------------------------------------- #
-# Spin markers (plain / one_orbital / duo / rgb, ONLY when both spins are shown)
+# Spin handling (ISPIN=2)
 # --------------------------------------------------------------------------- #
-# With both spin channels overlaid, circles are replaced by very small
-# triangles so the two channels never sit ambiguously on top of each other:
-# spin-up -> up-triangle, spin-down -> down-triangle. The marker EDGE encodes
-# the spin too -- pure cyan for up, pure magenta for down -- which stays visible
-# even where the (weight-dependent) face is almost transparent.
-SPIN_UP_MARKER = "^"
-SPIN_DOWN_MARKER = "v"
-# Dark cyan / dark magenta: a sweet spot that reads clearly against the white
-# background (bright pure cyan/magenta wash out there) yet stays distinct from
-# the face colours inside the triangles (duo blue/orange, rgb red/green/blue),
-# so the spin outline never gets confused with the projection colour.
-SPIN_UP_EDGE = "#0B9AA6"   # dark cyan   (spin up)
-SPIN_DOWN_EDGE = "#C2188C" # dark magenta (spin down)
-SPIN_EDGE_LW = 0.5         # triangle outline width (pt) -- keep them tiny
+# There is NO in-figure overlay of the two channels any more: --spin up / down
+# each draw a single channel with the standard circles, and --spin both renders
+# the spin-up plot, the spin-down plot, AND a dedicated two-colour overlaid
+# "plain" plot (below).  No cyan/magenta marker edges are drawn for any method.
+
+# --------------------------------------------------------------------------- #
+# Overlaid "plain" plot (ISPIN=2, --spin both): both channels in ONE plain plot
+# --------------------------------------------------------------------------- #
+# No projections.  Spin-up bands are pure-RGB blue, spin-down pure-RGB orange,
+# drawn as the usual slightly-translucent plain circles.  The single grey band
+# backbone is replaced by TWO per-spin backbones: very thin, dashed, highly
+# transparent, pale blue (up) and pale orange (down).
+OVERLAY_UP_COLOR = "#0000FF"      # spin up   -> pure RGB blue
+OVERLAY_DOWN_COLOR = "#FF8000"    # spin down -> vivid orange
+OVERLAY_UP_BACKBONE = "#7FA8FF"   # pale blue   backbone (spin up)
+OVERLAY_DOWN_BACKBONE = "#FFC080"  # pale orange backbone (spin down)
+OVERLAY_BACKBONE_LW = 0.4         # very thin
+OVERLAY_BACKBONE_LS = (0, (4, 3))  # dashed "--"
+OVERLAY_BACKBONE_ALPHA = 0.30     # highly transparent
 
 # --------------------------------------------------------------------------- #
 # "plain" method: black k-point dots on the shared backbone
 # --------------------------------------------------------------------------- #
-PLAIN_MARKER_SIZE = 4.0    # small black circle/triangle area (pt^2)
+PLAIN_MARKER_SIZE = 4.0    # small black circle area (pt^2)
 PLAIN_MARKER_COLOR = "#000000"
 PLAIN_ALPHA = 0.5          # intermediate opacity of the plain k-point markers
-PLAIN_EVERY_KPOINT = True  # a dot at every computed k-point (no subsampling)
 
 # --------------------------------------------------------------------------- #
 # Shared band backbone -- drawn FIRST (in the background) for EVERY method.
@@ -114,10 +126,16 @@ BACKBONE_COLOR = "0.80"    # very pale grey (0=black, 1=white)
 # --------------------------------------------------------------------------- #
 # "stacked" method (sumo-compatible)
 # --------------------------------------------------------------------------- #
-STACKED_COLORS = ["#3952A3", "#FAA41A", "#67BC47", "#6ECCDD", "#ED2025"]
+STACKED_COLORS = ["#3952A3", "#FAA41A", "#67BC47", "#6ECCDD", "#ED2025"]  # sumo palette
 STACKED_CIRCLE_SIZE = 45.0    # sumo 'circle_size' (area; scaled by w**2); sumo=150
 STACKED_PROJ_CUTOFF = 0.001   # sumo 'projection_cutoff'
 STACKED_INTERP = 4            # sumo 'interpolate_factor'
+# How sumo normalises each point's projection weights before sizing the circles:
+#   "select" -> divide by the sum over the SELECTED groups (sumo's stacked look:
+#               the chosen orbitals' circles share the marker area at each point);
+#   "all"    -> divide by the total state weight (selected + unselected);
+#   "none"   -> raw projection magnitudes.
+STACKED_NORMALISE = "select"
 
 # --------------------------------------------------------------------------- #
 # Band-edge (VBM/CBM) markers

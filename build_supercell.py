@@ -112,6 +112,7 @@ def parse_scaling(values):
 
 
 def main():
+    """CLI entry point: build a supercell from a POSCAR and write it out."""
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,

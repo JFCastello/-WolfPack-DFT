@@ -13,8 +13,8 @@ CLUSTER PROFILE
   The partition names, cores/node, memory/node, the module-load lines for your
   chosen VASP build, the notification email and the account core cap are read
   from the per-user profile written by `vasp-configure`
-  (~/.config/wolfpack-dft/cluster.conf).  Without a profile, the built-in NLHPC
-  partitions below are used as a worked example/default.
+  (~/.config/wolfpack-dft/cluster.conf).  Without a profile, a built-in set of
+  example partitions below is used as a sensible default.
 
 Authoritative references (all consulted while writing this script):
 
@@ -28,7 +28,6 @@ Authoritative references (all consulted while writing this script):
   * https://vasp.at/wiki/Memory_requirements
   * https://vasp.at/wiki/Not_enough_memory
   * https://vasp.at/wiki/Performance_issues,_try_NCORE,_KPAR,_ALGO,_LREAL
-  * https://wiki.nlhpc.cl/VASP                          (NLHPC SLURM recipe)
   * https://docs.nersc.gov/applications/vasp/           (memory scaling, OUTCAR)
 
 ================================================================================
@@ -81,7 +80,7 @@ WHAT THIS REWRITE FIXES COMPARED TO THE OLD TOOL
        "Setting NCORE equal to the number of cores per NUMA domain is often
         a particularly good choice."              (NCORE wiki page)
 
-   The old tool hard-coded NCORE = 1.  That follows the NLHPC SLURM template
+   The old tool hard-coded NCORE = 1.  That follows a common SLURM template
    verbatim but contradicts the upstream VASP recipe and, for >100 atoms,
    leaves a factor-of-up-to-four performance on the table.  This rewrite
    enumerates NCORE in {1, 2, ..., min(cores_per_node, NUMA-size*2)} and
@@ -142,7 +141,7 @@ Step 2 -- run the recommender
     python3 vasp_recommend_slurm.py dryrun_OUTCAR
 
 That prints (a) the dry-run summary, (b) the top candidates table, and
-(c) a ready-to-submit NLHPC SLURM script for the best one.
+(c) a ready-to-submit SLURM script for the best one.
 
 Useful flags
 ------------
@@ -165,7 +164,7 @@ Useful flags
     --gw-mem-per-rank MB override the empirical GW per-rank anchor (MB)
     --gw-ref-ranks N     override the reference rank count used for GW scaling
     --gw-ref-encutgw EV  override the reference ENCUTGW used for GW scaling
-    --strict-ncore-one   force NCORE=1 (strict NLHPC recipe; not recommended)
+    --strict-ncore-one   force NCORE=1 (strict legacy recipe; not recommended)
     --allow-kpar-above-irr  permit KPAR > NKPTS (off by default per wiki)
     --nsim-choices 1 2 4 8  enumerate these NSIM values (default 4 only; CPU)
 
@@ -194,14 +193,14 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 
 # ============================================================================
-# NLHPC partition catalogue
+# Example partition catalogue (overridden by vasp-configure)
 # ============================================================================
-# Numbers come from https://wiki.nlhpc.cl/VASP and the NLHPC hardware page.
-# ``mem_per_cpu_mb`` is the value NLHPC itself uses in its SLURM templates.
+# Example numbers for a typical AMD/Intel SLURM cluster; override them with
+# vasp-configure. ``mem_per_cpu_mb`` is the per-CPU RAM the scheduler grants.
 # ``numa_cores`` is the typical NUMA-domain size; if you care about the
 # exact number, run ``lstopo`` or ``numactl --hardware`` on a compute node
 # and override with --numa-cores.
-NLHPC_PARTITIONS: Dict[str, Dict[str, object]] = {
+CLUSTER_PARTITIONS: Dict[str, Dict[str, object]] = {
     # -- AMD Zen4 (Genoa) partitions --------------------------------------
     "main": {
         "cpus_per_node": 256,
@@ -290,6 +289,7 @@ class MemoryBreakdown:
     total_mb: Optional[float] = None        # the headline number from OUTCAR
 
     def has_data(self) -> bool:
+        """True if the dry run captured the data needed to size the job."""
         return self.total_mb is not None
 
 
@@ -321,11 +321,9 @@ class DryRunSummary:
     calc_type: str = "DFT"
     gw_algo: Optional[str] = None        # the ALGO string that triggered GW/RPA
     nomega: Optional[int] = None         # NOMEGA: number of (imaginary) frequencies
-    nomegar: Optional[int] = None        # NOMEGAR (real-axis frequencies)
     nelmgw: Optional[int] = None         # NELMGW / (NELM for GW in 6.2 and older)
     encutgw: Optional[float] = None      # ENCUTGW: response-function cutoff
     nbandsgw: Optional[int] = None       # NBANDSGW: bands updated in self-consistency
-    loptics: Optional[bool] = None       # LOPTICS (writes WAVEDER)
     ntaupar_dry: Optional[int] = None    # NTAUPAR found in the OUTCAR (if any)
     nomegapar_dry: Optional[int] = None  # NOMEGAPAR found in the OUTCAR (if any)
     # Low-scaling-specific FFT grids (printed by VASP for space-time GW/RPA):
@@ -413,6 +411,7 @@ class Candidate:
 
     @property
     def incar_snippet(self) -> str:
+        """Return the INCAR parallelization snippet for this candidate's calc type."""
         if self.calc_type == "DFT":
             return self._incar_snippet_dft()
         if self.calc_type == "GW_CONVENTIONAL":
@@ -421,6 +420,7 @@ class Candidate:
         return self._incar_snippet_gw_lowscaling()
 
     def _incar_snippet_dft(self) -> str:
+        """INCAR snippet for a standard DFT / hybrid run."""
         return (
             "# --- Parallelization (VASP wiki recipe; pure MPI) ---\n"
             f"KPAR   = {self.kpar}\n"
@@ -439,6 +439,7 @@ class Candidate:
         # NCORE / NPAR > 1 do not help the GW step itself, so we pin NCORE = 1
         # and drive everything through KPAR.
         # https://vasp.at/wiki/Practical_guide_to_GW_calculations
+        """INCAR snippet for a conventional (cubic-scaling) GW run."""
         rpk = self.ranks_per_kgroup
         return (
             "# --- Parallelization: CONVENTIONAL (quartic-scaling) GW ---\n"
@@ -459,6 +460,7 @@ class Candidate:
         # MAXMEM and letting it pick NTAUPAR/NOMEGAPAR automatically.
         # https://vasp.at/wiki/Practical_guide_to_GW_calculations
         # https://vasp.at/wiki/NTAUPAR  https://vasp.at/wiki/NOMEGAPAR
+        """INCAR snippet for a low-scaling (space-time) GW/RPA run."""
         is_rpa = self.calc_type == "RPA_LOWSCALING"
         head = "LOW-SCALING RPA" if is_rpa else "LOW-SCALING (space-time) GW"
         maxmem = self.memory.maxmem_mb
@@ -516,10 +518,12 @@ def positive_divisors(n: int) -> List[int]:
 
 
 def format_bool(value: bool) -> str:
+    """Render a Python bool as a VASP INCAR flag (.TRUE./.FALSE.)."""
     return ".TRUE." if value else ".FALSE."
 
 
 def round_up_to_multiple(n: int, m: int) -> int:
+    """Smallest multiple of `m` that is >= `n` (returns `n` if m <= 0)."""
     if m <= 0:
         return n
     return ((n + m - 1) // m) * m
@@ -536,6 +540,7 @@ def round_up_mem(mb: float, step: int = 50) -> int:
 
 
 def _read_text(path: Path) -> str:
+    """Read a file as text, exiting with a clear message if it cannot be read."""
     try:
         return path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
@@ -543,6 +548,7 @@ def _read_text(path: Path) -> str:
 
 
 def _first_int(patterns: Sequence[str], text: str) -> Optional[int]:
+    """Return the first integer captured by any of `patterns` in `text`, else None."""
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.MULTILINE | re.IGNORECASE)
         if match:
@@ -554,6 +560,7 @@ def _first_int(patterns: Sequence[str], text: str) -> Optional[int]:
 
 
 def _first_float(patterns: Sequence[str], text: str) -> Optional[float]:
+    """Return the first float captured by any of `patterns` in `text`, else None."""
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.MULTILINE | re.IGNORECASE)
         if match:
@@ -565,6 +572,7 @@ def _first_float(patterns: Sequence[str], text: str) -> Optional[float]:
 
 
 def _first_str(patterns: Sequence[str], text: str) -> Optional[str]:
+    """Return the first string captured by any of `patterns` in `text`, else None."""
     for pattern in patterns:
         match = re.search(pattern, text, flags=re.MULTILINE | re.IGNORECASE)
         if match:
@@ -737,7 +745,7 @@ RPA_LOWSCALING_ALGOS = {
 # GW per-rank memory by ~10x.  Instead we anchor to a MEASURED data point and
 # scale it by the variables that actually drive GW memory.
 #
-# Measured reference (Castello, CuVS3, G0W0@PBE+U via EVGW0, NLHPC):
+# Measured reference (CuVS3, G0W0@PBE+U via EVGW0):
 #     per-rank memory   ~ 2292 MB
 #     NOMEGA            = 100
 #     ISPIN             = 2
@@ -903,6 +911,7 @@ def detect_calculation_type(
 
 def parse_outcar(outcar_path: Path,
                  calc_type_override: Optional[str] = None) -> DryRunSummary:
+    """Parse a dry-run OUTCAR into a DryRunSummary (sizes, k-points, GW tags, memory table)."""
     text = _read_text(outcar_path)
     s = DryRunSummary(outcar_path=outcar_path)
 
@@ -968,15 +977,11 @@ def parse_outcar(outcar_path: Path,
 
     # --- GW / RPA tags (informational + needed for the τ/ω grid split) ---
     s.nomega = _first_int([r"\bNOMEGA\s*=\s*(\d+)"], text)
-    s.nomegar = _first_int([r"\bNOMEGAR\s*=\s*(\d+)"], text)
     s.nelmgw = _first_int([r"\bNELMGW\s*=\s*(\d+)"], text)
     s.encutgw = _first_float([r"\bENCUTGW\s*=\s*([0-9.]+)"], text)
     s.nbandsgw = _first_int([r"\bNBANDSGW\s*=\s*(\d+)"], text)
     s.ntaupar_dry = _first_int([r"\bNTAUPAR\s*=\s*(\d+)"], text)
     s.nomegapar_dry = _first_int([r"\bNOMEGAPAR\s*=\s*(\d+)"], text)
-    _loptics = _first_str([r"\bLOPTICS\s*=\s*([TF\.]\w*)"], text)
-    if _loptics is not None:
-        s.loptics = _loptics.strip().upper().startswith((".T", "T"))
     # Low-scaling FFT grids (printed only for space-time GW/RPA runs):
     s.fft_exx = _parse_named_fft_grid(
         text, r"FFT grid for exact exchange(?:\s*\(Hartree[ -]?Fock\))?")
@@ -1289,7 +1294,7 @@ def suggest_total_ranks(
                 out.add(n)
             n += irr_kpoints
 
-    # Round numbers commonly used in VASP benchmarks / NLHPC docs
+    # Round numbers commonly used in VASP benchmarks
     for n in (8, 12, 16, 20, 24, 32, 40, 44, 48, 64, 80, 88, 96, 120, 128):
         if min_cores <= n <= max_cores:
             out.add(n)
@@ -1466,7 +1471,7 @@ def score_candidate(
             else:
                 parts["lplane_FALSE_unnecessary_(SMALL_PENALTY)"] = -1.5
     else:
-        # Default-on LPLANE is the wiki default (and the NLHPC template).
+        # Default-on LPLANE is the VASP-wiki default.
         parts["lplane_default_preference"] = 1.5 if candidate.lplane else -1.5
 
     # ---- 6. NSIM ---------------------------------------------------------
@@ -1480,7 +1485,7 @@ def score_candidate(
         parts["nsim_unusual"] = -1.0
 
     # ---- 7. Memory feasibility ------------------------------------------
-    # Memory cost is the binding constraint on NLHPC's small per-CPU RAM
+    # Memory cost is the binding constraint on clusters with small per-CPU RAM
     # budget (2839 MB on `main`).  The VASP wiki explicitly conditions the
     # "increase KPAR up to NKPTS" advice on "given sufficient memory" -- so
     # the penalties below have to be strong enough to overcome the +6
@@ -1513,13 +1518,13 @@ def score_candidate(
         candidate.total_ranks / max(1, max_cores)
     )
 
-    # ---- 10. NLHPC-specific bonus: KPAR ~ 4 on AMD `main` ---------------
-    # NLHPC's documented recipe for the AMD partition.
+    # ---- 10. AMD-partition bonus: KPAR ~ 4 ----------------------------
+    # A common recipe for AMD (zen) partitions.
     if is_amd_zen4 and irr_k and irr_k >= 4:
         if candidate.kpar == 4:
-            parts["nlhpc_amd_kpar_4_default"] = 3.0
+            parts["amd_kpar_4_default"] = 3.0
         elif candidate.kpar in (2, 8) and irr_k % candidate.kpar == 0:
-            parts["nlhpc_amd_kpar_near_4"] = 1.5
+            parts["amd_kpar_near_4"] = 1.5
 
     score = float(sum(parts.values()))
     return score, parts
@@ -1531,6 +1536,7 @@ def score_candidate(
 
 
 def explain_contributions(parts: Dict[str, float], top: int = 10) -> List[str]:
+    """Return human-readable lines explaining a candidate's score breakdown."""
     ordered = sorted(parts.items(), key=lambda kv: abs(kv[1]), reverse=True)[:top]
     out: List[str] = []
     for key, value in ordered:
@@ -1562,7 +1568,7 @@ def build_candidates(
     if max_cores < min_cores or max_cores < 1:
         raise SystemExit("--max-cores must be >= --min-cores and >= 1.")
 
-    partition_info = NLHPC_PARTITIONS[partition_name]
+    partition_info = CLUSTER_PARTITIONS[partition_name]
     part_mem_per_cpu = int(partition_info["mem_per_cpu_mb"])  # type: ignore[arg-type]
 
     irr_k = summary.irr_kpoints or summary.nkpts
@@ -2005,12 +2011,12 @@ def score_gw_candidate(
         candidate.total_ranks / max(1, max_cores)
     )
 
-    # ---- NLHPC AMD bonus: KPAR ~ 4 --------------------------------------
+    # ---- AMD bonus: KPAR ~ 4 -------------------------------------------
     if is_amd_zen4 and irr_k and irr_k >= 4:
         if candidate.kpar == 4:
-            parts["nlhpc_amd_kpar_4_default"] = 3.0
+            parts["amd_kpar_4_default"] = 3.0
         elif candidate.kpar in (2, 8) and irr_k % candidate.kpar == 0:
-            parts["nlhpc_amd_kpar_near_4"] = 1.5
+            parts["amd_kpar_near_4"] = 1.5
 
     score = float(sum(parts.values()))
     return score, parts
@@ -2041,7 +2047,7 @@ def build_gw_candidates(
     if max_cores < min_cores or max_cores < 1:
         raise SystemExit("--max-cores must be >= --min-cores and >= 1.")
 
-    partition_info = NLHPC_PARTITIONS[partition_name]
+    partition_info = CLUSTER_PARTITIONS[partition_name]
     part_mem_per_cpu = int(partition_info["mem_per_cpu_mb"])  # type: ignore[arg-type]
     irr_k = summary.irr_kpoints or summary.nkpts
     low = summary.calc_type in ("GW_LOWSCALING", "RPA_LOWSCALING")
@@ -2156,9 +2162,69 @@ def build_gw_candidates(
 
 
 def pick_executable(summary: DryRunSummary, override: Optional[str]) -> str:
+    """Choose the VASP binary (vasp_std/gam/ncl) from the summary or an override."""
     if override:
         return override
     return "vasp_gam" if summary.is_gamma_only else "vasp_std"
+
+
+def _node_mem_mb(partition_info: Dict[str, object], fallback_mem_per_cpu: int) -> int:
+    """Total RAM per node (MB): from the profile, else cpus_per_node x mem/cpu."""
+    nm = partition_info.get("node_mem_mb")
+    if nm:
+        return int(nm)                                       # type: ignore[arg-type]
+    cpn = int(partition_info.get("cpus_per_node", 1))        # type: ignore[arg-type]
+    mpc = int(partition_info.get("mem_per_cpu_mb", fallback_mem_per_cpu))  # type: ignore[arg-type]
+    return cpn * mpc
+
+
+# Real resident memory (RSS) is consistently LARGER than the per-rank figure
+# VASP reports in the OUTCAR: FFTW plans/scratch, MPI/UCX communication buffers,
+# the scaLAPACK/ELPA workspace and the allocator's high-water mark are not in
+# VASP's table. Across DFT runs this gap is ~1.3-2x; for GW/RPA it is much
+# larger (the chi/W arrays dwarf the DFT table). We therefore scale the model's
+# per-rank estimate by this factor before sizing the request, so the dry-run
+# recommendation is a *safe* starting point. vasp-test then replaces it with the
+# measured value. Override with --rss-overhead / WP_RSS_OVERHEAD.
+DEFAULT_RSS_OVERHEAD = 1.4
+
+
+def compute_request_geometry(candidate: "Candidate",
+                             partition_info: Dict[str, object],
+                             mem_util: float = 0.80,
+                             reserve_mb: int = 0,
+                             rss_overhead: float = DEFAULT_RSS_OVERHEAD):
+    """Size the memory request and node layout for the cluster policy.
+
+    Returns (mem_per_cpu, nodes, ntasks_per_node, node_mem_mb).
+
+      * the model per-rank estimate is first multiplied by `rss_overhead` (the
+        documented gap between VASP's reported memory and real RSS);
+      * mem_per_cpu then honours the minimum memory-UTILISATION policy: we
+        request so predicted usage is `mem_util` of the allocation
+        (request = usage / mem_util). With mem_util=0.80 the job is sized to use
+        ~80% of what it asks for (and keeps ~20% safety headroom);
+      * if a single node cannot hold its ranks at that mem-per-cpu, the job is
+        SPLIT across more nodes (fewer ranks per node) so every node fits --
+        per https://www.vasp.at/wiki/index.php/Category:Parallelization the
+        rank count is unchanged; only the rank-to-node mapping spreads out;
+      * `reserve_mb` keeps that much RAM free per node (e.g. debug/login nodes).
+    """
+    per_rank = max(float(candidate.memory.per_rank_mb), 1.0) * max(rss_overhead, 1.0)
+    mem_per_cpu = max(200, round_up_mem(per_rank / max(mem_util, 0.05)))
+    if getattr(candidate, "recommend_maxmem", False) and candidate.memory.maxmem_mb:
+        mem_per_cpu = max(mem_per_cpu, candidate.memory.maxmem_mb + 150)
+
+    cpn = int(partition_info.get("cpus_per_node", candidate.ntasks_per_node) or 1)
+    node_mem = _node_mem_mb(partition_info, mem_per_cpu)
+    usable = max(mem_per_cpu, node_mem - max(reserve_mb, 0))
+    total = max(candidate.total_ranks, 1)
+
+    by_mem = max(1, usable // max(mem_per_cpu, 1))           # ranks that fit by RAM
+    ntpn = min(cpn, total, by_mem)
+    nodes = math.ceil(total / ntpn)
+    ntpn = min(cpn, math.ceil(total / nodes))               # even fill across nodes
+    return mem_per_cpu, nodes, ntpn, node_mem
 
 
 def slurm_script(
@@ -2171,21 +2237,13 @@ def slurm_script(
     job_name: str,
     executable: str,
     time_limit: str,
+    mem_util: float = 0.80,
+    reserve_mb: int = 0,
+    rss_overhead: float = DEFAULT_RSS_OVERHEAD,
 ) -> str:
-    # Use the candidate's suggested mem-per-cpu directly.  NLHPC's
-    # partition default is just the value SLURM uses if you don't ask --
-    # asking for less is perfectly fine and helps the scheduler pack other
-    # jobs alongside yours.  Asking for more is fine too (the SLURM script
-    # below will already do so when the prediction says we need it).
-    # The only reason to clamp UP to the partition default would be if the
-    # prediction were untrustworthy; with Tier 1/2 anchoring on VASP's own
-    # number, it's not.  We still never go below 200 MB.
-    mem_per_cpu = max(200, candidate.memory.suggested_mem_per_cpu_mb)
-    # If we recommend MAXMEM in the INCAR (low-scaling GW/RPA), SLURM must
-    # grant at least that much per rank or VASP's auto-chosen NTAUPAR will be
-    # OOM-killed by the cgroup.  Add a little headroom above MAXMEM.
-    if getattr(candidate, "recommend_maxmem", False) and candidate.memory.maxmem_mb:
-        mem_per_cpu = max(mem_per_cpu, candidate.memory.maxmem_mb + 150)
+    """Render the production SLURM script for a candidate (80% memory + node split)."""
+    mem_per_cpu, nodes, ntpn, node_mem = compute_request_geometry(
+        candidate, partition_info, mem_util, reserve_mb, rss_overhead)
     modules: List[str] = list(partition_info["modules"])     # type: ignore[arg-type]
     extra_env: List[str] = list(partition_info["extra_env"]) # type: ignore[arg-type]
 
@@ -2194,8 +2252,9 @@ def slurm_script(
         f'#SBATCH --job-name="{job_name}"',
         f"#SBATCH --partition={partition_info.get('slurm_name', partition_name)}",
         f"#SBATCH --time={time_limit}",
+        f"#SBATCH --nodes={nodes}",
         f"#SBATCH --ntasks={candidate.total_ranks}",
-        f"#SBATCH --ntasks-per-node={candidate.ntasks_per_node}",
+        f"#SBATCH --ntasks-per-node={ntpn}",
         "#SBATCH --cpus-per-task=1",                    # pure MPI
         f"#SBATCH --mem-per-cpu={mem_per_cpu}",
         "#SBATCH --output=%x-%j.out",
@@ -2205,6 +2264,12 @@ def slurm_script(
         lines.append(f"#SBATCH --mail-user={email}")
         lines.append("#SBATCH --mail-type=ALL")
 
+    note = (f"# memory sized for >= {mem_util*100:.0f}% utilisation "
+            f"({mem_per_cpu} MB/cpu x {ntpn}/node = {mem_per_cpu*ntpn/1024:.0f} GB "
+            f"of {node_mem/1024:.0f} GB)")
+    if nodes > 1:
+        note += f"; spread over {nodes} nodes so each node's RAM fits"
+    lines.extend(["", note])
     lines.extend(["", "# --- Modules (from your cluster profile) ---", *modules])
     lines.extend(["", "# --- Pure-MPI environment ---", *extra_env])
     lines.extend([
@@ -2225,8 +2290,9 @@ def slurm_script(
 
 
 def print_dryrun_summary(summary: DryRunSummary) -> None:
+    """Print the parsed dry-run summary block."""
     print("=" * 78)
-    print(" VASP PARALLELIZATION RECOMMENDER (NLHPC, pure MPI) ".center(78, "="))
+    print(" VASP PARALLELIZATION RECOMMENDER (pure MPI) ".center(78, "="))
     print("=" * 78)
     print("Built from the VASP wiki rules at https://vasp.at/wiki/Category:Performance.")
     print("Final answer is the result of a SHORT benchmark: take the top 2-3 candidates")
@@ -2332,6 +2398,7 @@ def print_partition_summary(
     min_cores: int,
     max_cores: int,
 ) -> None:
+    """Print the partition / core-and-memory limits block."""
     real = partition_info.get("slurm_name", partition_name)
     label = f"{partition_name} -> {real}" if real != partition_name else partition_name
     print("[TARGET HARDWARE]")
@@ -2348,6 +2415,7 @@ def print_partition_summary(
 
 
 def print_candidate_table(candidates: Sequence[Candidate], top: int) -> None:
+    """Print the ranked table of the best candidate per rank count."""
     print("[TOP CANDIDATES]  (best INCAR shown for each total_ranks; sorted by score)")
     calc_type = candidates[0].calc_type if candidates else "DFT"
     low = calc_type in ("GW_LOWSCALING", "RPA_LOWSCALING")
@@ -2411,6 +2479,7 @@ def print_best_candidate(
     executable: str,
     time_limit: str,
 ) -> None:
+    """Print the full recommendation for the top candidate (layout, memory, INCAR, SLURM)."""
     print("=" * 78)
     print(" BEST CANDIDATE ".center(78, "="))
     print("=" * 78)
@@ -2483,7 +2552,6 @@ def print_best_candidate(
             "NO  -- raise total ranks, lower KPAR, or use a larger-mem partition"
         print(f"  fits partition?         : {fits}")
         # ENCUTGW is the dominant (cubic) memory knob; flag the default=ENCUT trap.
-        eff_encutgw = summary.encutgw or summary.encut
         if summary.encutgw is None and summary.encut is not None:
             print(f"  WARNING: ENCUTGW is unset -> defaults to ENCUT = "
                   f"{summary.encut:.0f} eV. GW memory ~ ENCUTGW^3, so this is")
@@ -2540,6 +2608,7 @@ def print_best_candidate(
 
 
 def write_csv(path: Path, candidates: Sequence[Candidate]) -> None:
+    """Write the full ranked candidate list to a CSV file."""
     fieldnames = [
         "score", "total_ranks", "nodes", "ntasks_per_node",
         "kpar", "ncore", "npar", "nsim", "lplane",
@@ -2596,18 +2665,22 @@ def write_csv(path: Path, candidates: Sequence[Candidate]) -> None:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """Build and return the argparse parser for the recommender CLI."""
     parser = argparse.ArgumentParser(
         description=(
-            "NLHPC VASP parallelization recommender (pure MPI). "
+            "VASP parallelization recommender for SLURM clusters (pure MPI). "
             "Reads a dry-run OUTCAR, follows the VASP wiki recipe to enumerate "
             "candidate (KPAR, NCORE, NPAR, NSIM, LPLANE) tuples, rescales "
             "VASP's own memory table to predict per-rank RAM for each, and "
             "prints INCAR + SLURM for the best one."
         )
     )
-    parser.add_argument("outcar", type=Path,
-                        help="Path to a previous dry-run OUTCAR "
-                             "(ALGO=None or vasp --dry-run).")
+    parser.add_argument("outcar", type=Path, nargs="?", default=None,
+                        help="Path to a dry-run OUTCAR. If omitted, auto-find "
+                             "the one produced by vasp-dry-run "
+                             "(.wolfpack/dryrun_OUTCAR, ./dryrun_OUTCAR or "
+                             "./OUTCAR) so the dry-run -> recommend chain needs "
+                             "no arguments.")
     parser.add_argument("--max-cores", type=int, default=None,
                         help="Account-wide MPI-rank cap (default: from the "
                              "cluster profile written by vasp-configure, else "
@@ -2615,7 +2688,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-cores", type=int, default=8,
                         help="Smallest total_ranks to evaluate (default 8).")
     parser.add_argument("--partition",
-                        choices=sorted(NLHPC_PARTITIONS.keys()),
+                        choices=sorted(CLUSTER_PARTITIONS.keys()),
                         default="main",
                         help="Logical partition: 'main' or 'debug' (mapped to "
                              "your real partition names by vasp-configure; "
@@ -2635,20 +2708,43 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "Raise to 1.30-1.50 if you have hit OOM kills "
                              "or if you trust VASP's numbers less; lower to "
                              "1.05 for a very tight ask.")
+    parser.add_argument("--mem-util", type=float, default=None,
+                        help="Minimum memory-utilisation fraction your cluster "
+                             "requires (default: WP_MEM_UTIL from the profile, "
+                             "else 0.80). The SLURM request is sized to "
+                             "need/util so the job uses ~this fraction of its "
+                             "allocation.")
+    parser.add_argument("--rss-overhead", type=float, default=None,
+                        help="Multiplier on VASP's reported per-rank memory to "
+                             "approximate real RSS (FFT/MPI/scaLAPACK/allocator "
+                             "overhead not in VASP's table). Default: "
+                             "WP_RSS_OVERHEAD from the profile, else 1.4. "
+                             "vasp-test supersedes this with the measured value.")
     parser.add_argument("--top", type=int, default=10,
                         help="Number of top candidates to print (default 10).")
     parser.add_argument("--csv", type=Path, default=None,
                         help="Optional path: write the full ranked list as CSV.")
-    parser.add_argument("--write-slurm", type=Path, default=Path("slurm_job.sh"),
+    parser.add_argument("--write-slurm", type=Path, default=Path("slurm.sh"),
                         metavar="FILE",
-                        help="Write the recommended SLURM script to this file "
-                             "(default: ./slurm_job.sh) so the exact job you "
-                             "submit is on disk for inspection. Use --no-write "
-                             "to only print it.")
-    parser.add_argument("--write-incar", type=Path, default=Path("INCAR.parallel"),
+                        help="Write the recommended production SLURM script here "
+                             "(default: ./slurm.sh). vasp-test later updates its "
+                             "memory from the benchmark. Use --no-write to skip.")
+    parser.add_argument("--write-incar", type=Path, default=None,
                         metavar="FILE",
-                        help="Write the recommended INCAR parallelization "
-                             "snippet to this file (default: ./INCAR.parallel).")
+                        help="Also write the INCAR snippet to a separate file "
+                             "(default: none; the snippet is embedded as comments "
+                             "in slurm.sh and shown in report.out).")
+    parser.add_argument("--report", type=Path, default=Path("report.out"),
+                        metavar="FILE",
+                        help="Append the recommendation to this combined report "
+                             "(default: ./report.out). Use --no-report to skip.")
+    parser.add_argument("--no-report", action="store_true",
+                        help="Do not append to report.out.")
+    parser.add_argument("--state", type=Path,
+                        default=Path(".wolfpack/state.env"),
+                        help="Machine-readable state file for the dry-run -> "
+                             "recommend -> test chain (default: "
+                             ".wolfpack/state.env).")
     parser.add_argument("--no-write", action="store_true",
                         help="Do not write any files; only print to stdout.")
     parser.add_argument("--email", type=str, default=None,
@@ -2662,7 +2758,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="VASP executable. Auto-detected from dry run if "
                              "omitted.")
     parser.add_argument("--strict-ncore-one", action="store_true",
-                        help="Force NCORE=1 in all candidates (strict NLHPC "
+                        help="Force NCORE=1 in all candidates (strict legacy "
                              "template).  By default we enumerate NCORE > 1 "
                              "as well, following the VASP wiki recommendation "
                              "of NCORE ~ sqrt(available_ranks) on modern "
@@ -2721,7 +2817,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 # ============================================================================
 # Cluster profile (written by vasp-configure)
 # ============================================================================
-# The toolkit ships with the NLHPC partitions above as a built-in default, but
+# The toolkit ships with the example partitions above as a built-in default, but
 # `vasp-configure` writes a per-user profile describing the ACTUAL cluster
 # (partition names, cores/node, memory/node, the module-load lines for the
 # chosen VASP build, the notification email and the account core cap). When
@@ -2730,6 +2826,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _config_path() -> Path:
+    """Path to the user's cluster profile (WOLFPACK_CLUSTER_CONF or the default)."""
     env = os.environ.get("WOLFPACK_CLUSTER_CONF")
     if env:
         return Path(env).expanduser()
@@ -2771,21 +2868,25 @@ def _profile_module_lines(prof: Dict[str, str]) -> List[str]:
 
 
 def _profile_extra_env(prof: Dict[str, str]) -> List[str]:
+    """Split the profile's WP_EXTRA_ENV ';'-list into individual shell statements."""
     return [e.strip() for e in (prof.get("WP_EXTRA_ENV") or "").split(";")
             if e.strip()]
 
 
 def apply_cluster_profile(prof: Dict[str, str]) -> None:
-    """Fold the user's cluster profile into NLHPC_PARTITIONS['main'/'debug']."""
+    """Fold the user's cluster profile into CLUSTER_PARTITIONS['main'/'debug']."""
     if not prof:
         return
     mods = _profile_module_lines(prof)
     env = _profile_extra_env(prof)
 
     def _apply(key: str, name_k: str, cpus_k: str, mem_k: str) -> None:
-        info = dict(NLHPC_PARTITIONS.get(key, {}))
+        """Fold one partition's WP_* profile keys into the catalogue entry."""
+        info = dict(CLUSTER_PARTITIONS.get(key, {}))
         cpus = prof.get(cpus_k, "")
         mem = prof.get(mem_k, "")
+        if mem.isdigit():
+            info["node_mem_mb"] = int(mem)          # total RAM per node (MB)
         if cpus.isdigit():
             cpn = int(cpus)
             info["cpus_per_node"] = cpn
@@ -2802,7 +2903,7 @@ def apply_cluster_profile(prof: Dict[str, str]) -> None:
         if name:
             info["slurm_name"] = name
         info.setdefault("arch", "configured")
-        NLHPC_PARTITIONS[key] = info
+        CLUSTER_PARTITIONS[key] = info
 
     _apply("main", "WP_MAIN_PARTITION",
            "WP_MAIN_CPUS_PER_NODE", "WP_MAIN_MEM_PER_NODE_MB")
@@ -2810,12 +2911,83 @@ def apply_cluster_profile(prof: Dict[str, str]) -> None:
            "WP_DEBUG_CPUS_PER_NODE", "WP_DEBUG_MEM_PER_NODE_MB")
 
 
+# ============================================================================
+# Pipeline orchestration helpers (dry-run -> recommend -> test)
+# ============================================================================
+def _find_dryrun_outcar() -> Optional[Path]:
+    """Locate the dry-run OUTCAR for the no-argument recommend step."""
+    for p in (Path(".wolfpack/dryrun_OUTCAR"), Path("dryrun_OUTCAR"), Path("OUTCAR")):
+        if p.is_file():
+            return p
+    return None
+
+
+def _now() -> str:
+    """Current local timestamp as 'YYYY-MM-DD HH:MM:SS'."""
+    import datetime as _dt
+    return _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def append_report(path: Path, title: str, body: str) -> None:
+    """Append a neatly-boxed section to the combined report.out."""
+    bar = "#" * 78
+    block = (f"\n{bar}\n"
+             f"#  {title}\n"
+             f"#  {_now()}\n"
+             f"{bar}\n\n{body.rstrip()}\n")
+    try:
+        with open(path, "a") as fh:
+            fh.write(block)
+    except OSError as exc:
+        print(f"[report] WARNING: could not append to {path}: {exc}",
+              file=sys.stderr)
+
+
+def write_state(path: Path, kv: Dict[str, object]) -> None:
+    """Merge KEY=VALUE state into the hidden pipeline state file."""
+    try:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing: Dict[str, str] = {}
+        if path.is_file():
+            for line in path.read_text().splitlines():
+                s = line.strip()
+                if s and not s.startswith("#") and "=" in s:
+                    k, v = s.split("=", 1)
+                    existing[k.strip()] = v.strip().strip('"')
+        existing.update({k: str(v) for k, v in kv.items()})
+        with open(path, "w") as fh:
+            fh.write("# WolfPack-DFT pipeline state (dry-run -> recommend -> test)\n")
+            for k, v in existing.items():
+                fh.write(f'{k}="{v}"\n')
+    except OSError as exc:
+        print(f"[state] WARNING: could not write {path}: {exc}", file=sys.stderr)
+
+
+def _embed_recommendation(script_text: str, candidate: "Candidate",
+                          meta: Dict[str, object]) -> str:
+    """Insert the INCAR snippet (as comments) + a machine-readable metadata
+    line after the shebang, so slurm.sh is self-documenting and vasp-test can
+    recover the FIXED parallel config from it."""
+    meta_str = " ".join(f"{k}={v}" for k, v in meta.items())
+    block = ["", "# ===================  WolfPack-DFT recommendation  ==================",
+             f"# WOLFPACK {meta_str}",
+             "# INCAR settings to merge into your INCAR (kept FIXED by vasp-test):"]
+    block += ["#   " + ln for ln in candidate.incar_snippet.splitlines()]
+    block += ["# ===================================================================="]
+    lines = script_text.split("\n")
+    if lines and lines[0].startswith("#!"):
+        return "\n".join([lines[0], *block, *lines[1:]])
+    return "\n".join([*block, *lines])
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    """CLI entry point: parse a dry-run OUTCAR and emit the parallelization recommendation."""
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
     # Fold the per-user cluster profile (vasp-configure) into the partition
-    # catalogue and resolve email / core-cap defaults from it.
+    # catalogue and resolve email / core-cap / mem-utilisation defaults from it.
     profile = load_cluster_profile()
     apply_cluster_profile(profile)
     if args.email is None:
@@ -2823,67 +2995,66 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.max_cores is None:
         mc = profile.get("WP_MAX_CORES", "")
         args.max_cores = int(mc) if mc.isdigit() else 120
+    if args.mem_util is None:
+        try:
+            args.mem_util = float(profile.get("WP_MEM_UTIL", "") or 0.80)
+        except ValueError:
+            args.mem_util = 0.80
+    args.mem_util = min(max(args.mem_util, 0.05), 1.0)
+    if args.rss_overhead is None:
+        try:
+            args.rss_overhead = float(profile.get("WP_RSS_OVERHEAD", "")
+                                      or DEFAULT_RSS_OVERHEAD)
+        except ValueError:
+            args.rss_overhead = DEFAULT_RSS_OVERHEAD
+    args.rss_overhead = max(args.rss_overhead, 1.0)
 
-    summary = parse_outcar(args.outcar, calc_type_override=args.calc_type)
+    # Resolve the dry-run OUTCAR (auto-find so `vasp-recommend-slurm` chains off
+    # `vasp-dry-run` with no arguments).
+    outcar = args.outcar or _find_dryrun_outcar()
+    if outcar is None:
+        print("ERROR: no dry-run OUTCAR found. Run 'vasp-dry-run' first (it "
+              "writes .wolfpack/dryrun_OUTCAR), or pass an OUTCAR path.",
+              file=sys.stderr)
+        return 2
+    if not Path(outcar).is_file():
+        print(f"ERROR: OUTCAR not found: {outcar}", file=sys.stderr)
+        return 2
+
+    summary = parse_outcar(outcar, calc_type_override=args.calc_type)
     # Allow a manual NOMEGA override for low-scaling τ/ω enumeration.
     if args.nomega is not None:
         summary.nomega = args.nomega
 
-    partition_info = NLHPC_PARTITIONS[args.partition]
+    partition_info = CLUSTER_PARTITIONS[args.partition]
     cpus_per_node = args.cores_per_node \
         or int(partition_info["cpus_per_node"])  # type: ignore[arg-type]
     numa_cores = args.numa_cores
     if numa_cores is None and partition_info.get("numa_cores"):
         numa_cores = int(partition_info["numa_cores"])  # type: ignore[arg-type]
 
-    print_dryrun_summary(summary)
-    print_partition_summary(
-        partition_name=args.partition,
-        partition_info=partition_info,
-        cpus_per_node=cpus_per_node,
-        numa_cores=numa_cores,
-        min_cores=args.min_cores,
-        max_cores=args.max_cores,
-    )
-
     is_gw = summary.calc_type in (
         "GW_CONVENTIONAL", "GW_LOWSCALING", "RPA_LOWSCALING")
+
+    # Build candidates first (so we can bail before printing on failure).
     if is_gw:
-        if summary.calc_type in ("GW_LOWSCALING", "RPA_LOWSCALING") \
-                and not summary.nomega:
-            print("[GW NOTE] Low-scaling GW/RPA detected but NOMEGA could not "
-                  "be read from the OUTCAR.\n"
-                  "          Falling back to a MAXMEM-only recommendation (no "
-                  "explicit NTAUPAR/NOMEGAPAR).\n"
-                  "          Pass --nomega N to enumerate the time/frequency "
-                  "grid split explicitly.\n")
         candidates = build_gw_candidates(
-            summary=summary,
-            min_cores=args.min_cores,
-            max_cores=args.max_cores,
-            partition_name=args.partition,
-            cpus_per_node=cpus_per_node,
-            numa_cores=numa_cores,
-            safety_factor=args.mem_headroom,
+            summary=summary, min_cores=args.min_cores, max_cores=args.max_cores,
+            partition_name=args.partition, cpus_per_node=cpus_per_node,
+            numa_cores=numa_cores, safety_factor=args.mem_headroom,
             limit_kpar_to_irr=not args.allow_kpar_above_irr,
             recommend_maxmem=not args.no_maxmem,
             gw_anchor_override=args.gw_mem_per_rank,
             gw_ref_ranks_override=args.gw_ref_ranks,
-            gw_ref_encutgw_override=args.gw_ref_encutgw,
-        )
+            gw_ref_encutgw_override=args.gw_ref_encutgw)
     else:
         candidates = build_candidates(
-            summary=summary,
-            min_cores=args.min_cores,
-            max_cores=args.max_cores,
-            partition_name=args.partition,
-            cpus_per_node=cpus_per_node,
-            numa_cores=numa_cores,
-            safety_factor=args.mem_headroom,
+            summary=summary, min_cores=args.min_cores, max_cores=args.max_cores,
+            partition_name=args.partition, cpus_per_node=cpus_per_node,
+            numa_cores=numa_cores, safety_factor=args.mem_headroom,
             limit_kpar_to_irr=not args.allow_kpar_above_irr,
             nsim_choices=tuple(args.nsim_choices),
-            strict_ncore_one=args.strict_ncore_one,
-        )
+            strict_ncore_one=args.strict_ncore_one)
 
     if not candidates:
         print("No valid candidates could be generated. "
@@ -2891,58 +3062,94 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               file=sys.stderr)
         return 1
 
-    # Best-per-rank-count table.
-    best_each = best_per_total_ranks(candidates)
-    print_candidate_table(best_each, top=max(1, args.top))
-
     executable = pick_executable(summary, args.executable)
-    print_best_candidate(
-        candidate=candidates[0],
-        partition_name=args.partition,
-        partition_info=partition_info,
-        summary=summary,
-        email=args.email or None,
-        job_name=args.job_name,
-        executable=executable,
-        time_limit=args.time,
-    )
+    best_each = best_per_total_ranks(candidates)
+
+    # Capture the full human-readable report so it can both print to the console
+    # and be appended to report.out (for the dry-run -> recommend -> test chain).
+    import io
+    import contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        print_dryrun_summary(summary)
+        print_partition_summary(
+            partition_name=args.partition, partition_info=partition_info,
+            cpus_per_node=cpus_per_node, numa_cores=numa_cores,
+            min_cores=args.min_cores, max_cores=args.max_cores)
+        if is_gw and summary.calc_type in ("GW_LOWSCALING", "RPA_LOWSCALING") \
+                and not summary.nomega:
+            print("[GW NOTE] Low-scaling GW/RPA detected but NOMEGA could not be "
+                  "read; using a MAXMEM-only recommendation. Pass --nomega N.\n")
+        print_candidate_table(best_each, top=max(1, args.top))
+        print_best_candidate(
+            candidate=candidates[0], partition_name=args.partition,
+            partition_info=partition_info, summary=summary,
+            email=args.email or None, job_name=args.job_name,
+            executable=executable, time_limit=args.time)
+        print(f"[MEMORY POLICY] SLURM memory sized for >= "
+              f"{args.mem_util*100:.0f}% utilisation (request = need / "
+              f"{args.mem_util:.2f}); vasp-test will refine it from a real run.")
+    out_text = buf.getvalue()
+    sys.stdout.write(out_text)
 
     if args.csv is not None:
         write_csv(args.csv, candidates)
         print(f"[CSV] Full ranked list written to {args.csv}")
 
-    # Write the recommended SLURM script + INCAR snippet to disk so the exact
-    # job you submit is recoverable if it later fails (see also vasp-test).
-    if not args.no_write:
-        script_text = slurm_script(
-            candidate=candidates[0],
-            partition_name=args.partition,
-            partition_info=partition_info,
-            summary=summary,
-            email=args.email or None,
-            job_name=args.job_name,
-            executable=executable,
-            time_limit=args.time,
-        )
+    if args.no_write:
+        return 0
+
+    # Geometry + 80%-utilisation memory for the production job.
+    best = candidates[0]
+    mem_per_cpu, nodes, ntpn, node_mem = compute_request_geometry(
+        best, partition_info, args.mem_util, rss_overhead=args.rss_overhead)
+    script_text = slurm_script(
+        candidate=best, partition_name=args.partition,
+        partition_info=partition_info, summary=summary,
+        email=args.email or None, job_name=args.job_name,
+        executable=executable, time_limit=args.time, mem_util=args.mem_util,
+        rss_overhead=args.rss_overhead)
+
+    meta = {
+        "stage": "recommend",
+        "calc": summary.calc_type,
+        "ranks": best.total_ranks,
+        "kpar": best.kpar, "ncore": best.ncore, "npar": best.npar,
+        "nsim": best.nsim,
+        "prod_partition": partition_info.get("slurm_name", args.partition),
+        "prod_cpn": cpus_per_node,
+        "node_mem_mb": node_mem,
+        "mem_per_cpu": mem_per_cpu,
+        "pred_mem_per_rank": int(round(best.memory.per_rank_mb)),
+        "mem_util": args.mem_util,
+        "exe": executable,
+    }
+    script_text = _embed_recommendation(script_text, best, meta)
+
+    try:
+        sp_path = Path(args.write_slurm)
+        sp_path.write_text(script_text + "\n")
         try:
-            sp_path = Path(args.write_slurm)
-            sp_path.write_text(script_text + "\n")
-            try:
-                os.chmod(sp_path, 0o755)
-            except OSError:
-                pass
-            inc_path = Path(args.write_incar)
-            inc_path.write_text(
-                "# INCAR parallelization snippet (vasp-recommend-slurm)\n"
-                + candidates[0].incar_snippet + "\n")
-            print()
-            print(f"[FILES] SLURM script written to : {sp_path}"
-                  f"   (submit with: sbatch {sp_path})")
-            print(f"[FILES] INCAR snippet written to: {inc_path}"
-                  f"   (merge into your INCAR)")
-        except OSError as exc:
-            print(f"[FILES] WARNING: could not write output files: {exc}",
-                  file=sys.stderr)
+            os.chmod(sp_path, 0o755)
+        except OSError:
+            pass
+        print(f"\n[FILES] production SLURM script -> {sp_path}"
+              f"   (submit with: sbatch {sp_path})")
+        if args.write_incar is not None:
+            Path(args.write_incar).write_text(best.incar_snippet + "\n")
+            print(f"[FILES] INCAR snippet           -> {args.write_incar}")
+    except OSError as exc:
+        print(f"[FILES] WARNING: could not write {args.write_slurm}: {exc}",
+              file=sys.stderr)
+
+    # Pipeline state for vasp-test (the FIXED config it must validate + scale).
+    write_state(args.state, meta)
+
+    # Combined, human-readable report.
+    if not args.no_report:
+        append_report(args.report, "STAGE 2/3 -- PARALLELIZATION RECOMMENDATION "
+                      "(vasp-recommend-slurm)", out_text)
+        print(f"[FILES] report section appended -> {args.report}")
 
     return 0
 

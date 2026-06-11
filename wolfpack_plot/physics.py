@@ -11,7 +11,6 @@ Derived physical quantities:
 """
 from __future__ import annotations
 
-import warnings
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +28,7 @@ from .vaspio import _parse_incar_tag, resolve_dos_smearing
 # Weights & projected DOS (band markers)
 # --------------------------------------------------------------------------- #
 def _group_raw_weight(group, bands_data):
+    """Total raw projected weight of a group over all bands/k-points (0 if none)."""
     proj = bands_data["projections"]
     if not proj:
         return None
@@ -63,6 +63,7 @@ def state_total_weight(bands_data):
 
 
 def dos_projection(group, dos_data):
+    """Projected DOS for a group: {spin: density over the energy grid} or None."""
     cdos = dos_data["cdos"]
     structure = cdos.structure
     tokens = group["orbitals"]
@@ -94,6 +95,7 @@ def dos_projection(group, dos_data):
 
 
 def _smear(energies, dens, sigma):
+    """Apply an extra Gaussian broadening (sigma eV) to a DOS array."""
     if not sigma or sigma <= 0:
         return dens
     de = float(np.mean(np.diff(energies)))

@@ -47,7 +47,7 @@ if _PKG_DIR not in sys.path:
     sys.path.insert(0, _PKG_DIR)
 
 from wolfpack_plot import generate, main          # noqa: E402,F401
-from wolfpack_plot.core import load_all, _make_cfg, list_structure  # noqa: E402,F401
+from wolfpack_plot.core import load_all, list_structure  # noqa: E402,F401
 from wolfpack_plot.config import METHODS          # noqa: E402,F401
 
 __all__ = ["generate", "main", "load_all", "list_structure", "METHODS"]

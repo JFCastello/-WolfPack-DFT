@@ -744,7 +744,7 @@ if [[ ${N_OCC:-0} -gt 0 ]]; then
   tip "converged ground-state WAVECAR. Set NBANDS well above N_occ=${N_OCC} and CONVERGE the QP gap vs NBANDS *and* ENCUTGW"
   tip "together; the guide recommends taking as many empty states as the basis allows (toward ~${CEIL:-the PW limit})."
   if [[ ${nb:-0} -gt 0 ]]; then
-    tip "For NLHPC pure-MPI: make NBANDS a multiple of the MPI ranks-per-k-point (= total ranks / KPAR) so VASP does not silently raise it."
+    tip "For pure-MPI: make NBANDS a multiple of the MPI ranks-per-k-point (= total ranks / KPAR) so VASP does not silently raise it."
   fi
 else
   note "No final eigenvalue/occupation block found -> cannot determine occupied bands (NWRITE too low, or OUTCAR truncated before the eigenvalues)."

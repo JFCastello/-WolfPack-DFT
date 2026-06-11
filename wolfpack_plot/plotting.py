@@ -21,13 +21,15 @@ from matplotlib.ticker import FuncFormatter, MaxNLocator
 from pymatgen.electronic_structure.core import Spin
 
 from .config import (ALPHA_MAX, ALPHA_MIN, BACKBONE_COLOR, BACKBONE_LW,
-                     DEFAULT_METHOD, DOS_LW, DOS_TOTAL_LW, DUO_CHANNELS,
-                     EDGE_CORE, EDGE_HALO, KPT_LABEL_SIZE, MARKER_SIZE,
-                     MARKER_TARGET, ONE_ORBITAL_CHANNEL, PLAIN_ALPHA,
-                     PLAIN_MARKER_COLOR, PLAIN_MARKER_SIZE, PROJ_CUTOFF,
-                     RGB_CHANNELS, SEG_WSPACE, SPIN_DOWN_EDGE, SPIN_DOWN_MARKER,
-                     SPIN_EDGE_LW, SPIN_UP_EDGE, SPIN_UP_MARKER,
-                     STACKED_CIRCLE_SIZE, STACKED_COLORS, STACKED_INTERP,
+                     CMYK_CHANNELS, DEFAULT_METHOD, DOS_LW, DOS_TOTAL_LW,
+                     DUO_CHANNELS, EDGE_CORE, EDGE_HALO, KPT_LABEL_SIZE,
+                     MARKER_SIZE, MARKER_TARGET, ONE_ORBITAL_CHANNEL,
+                     OVERLAY_BACKBONE_ALPHA, OVERLAY_BACKBONE_LS,
+                     OVERLAY_BACKBONE_LW, OVERLAY_DOWN_BACKBONE,
+                     OVERLAY_DOWN_COLOR, OVERLAY_UP_BACKBONE, OVERLAY_UP_COLOR,
+                     PLAIN_ALPHA, PLAIN_MARKER_COLOR, PLAIN_MARKER_SIZE,
+                     PROJ_CUTOFF, RGB_CHANNELS, SEG_WSPACE, STACKED_CIRCLE_SIZE,
+                     STACKED_COLORS, STACKED_INTERP, STACKED_NORMALISE,
                      STACKED_PROJ_CUTOFF, WIDTH_RATIOS)
 from .formatting import _auto_formula_tex, format_kpt_label, mathify_title
 from .physics import _smear, band_weights, dos_projection, state_total_weight
@@ -37,28 +39,37 @@ from .vaspio import _segment_ticks
 MARKER = "o"               # small circle: clearest when many bands overlap
 
 
-def _spin_marker(sp, show_both):
-    """Circle for a single channel; up/down triangle when both spins overlap."""
-    if not show_both:
-        return MARKER
-    return SPIN_UP_MARKER if sp == Spin.up else SPIN_DOWN_MARKER
-
-
-def _spin_edge(sp):
-    """Pure cyan outline for spin up, pure magenta for spin down."""
-    return SPIN_UP_EDGE if sp == Spin.up else SPIN_DOWN_EDGE
-
-
 # --------------------------------------------------------------------------- #
 # Colour helpers
 # --------------------------------------------------------------------------- #
 def _hybrid_colors(wRGB, channels=RGB_CHANNELS):
-    """Additive colour for each point from the relative group weights."""
+    """Additive colour for each point from the relative group weights.
+
+    Used by rgb (3 channels), duo (2) and one_orbital (1): the per-point colour
+    is the weight-weighted average of the channel colours.
+    """
     w = np.clip(np.asarray(wRGB, float), 0.0, None)            # (N,k)
     chan = np.array([mcolors.to_rgb(c) for c in channels])     # (k,3)
     s = w.sum(axis=1, keepdims=True)                          # (N,1)
     f = np.divide(w, s, out=np.zeros_like(w), where=s > 0)    # normalised mix
     return np.clip(f @ chan, 0.0, 1.0)
+
+
+def _cmyk_colors(w4, channels=CMYK_CHANNELS):
+    """Subtractive CMYK colour for each point from 4 relative group weights.
+
+    The four normalised weights become the (C, M, Y, K) fractions of a CMYK
+    colour, converted to RGB by R=(1-C)(1-K), G=(1-M)(1-K), B=(1-Y)(1-K).
+    A point dominated by group 0->cyan, 1->magenta, 2->yellow, 3->black.
+    `channels` is unused (kept for a common signature with _hybrid_colors).
+    """
+    w = np.clip(np.asarray(w4, float), 0.0, None)              # (N,4)
+    s = w.sum(axis=1, keepdims=True)                           # (N,1)
+    f = np.divide(w, s, out=np.zeros_like(w), where=s > 0)     # C,M,Y,K fractions
+    C, M, Y, K = f[:, 0], f[:, 1], f[:, 2], f[:, 3]
+    rgb = np.stack([(1 - C) * (1 - K), (1 - M) * (1 - K), (1 - Y) * (1 - K)],
+                   axis=1)
+    return np.clip(rgb, 0.0, 1.0)
 
 
 def _marker_indices(dist, sl, spacing):
@@ -90,32 +101,49 @@ def _draw_backbone(ax, bands_data, sl, spins, lsty):
                     ls=lsty(sp), zorder=1, solid_capstyle="round")
 
 
+def _draw_overlay_backbones(ax, bands_data, sl):
+    """Two per-spin backbones for the overlaid plain plot: very thin, dashed,
+    highly transparent, pale blue (up) and pale orange (down)."""
+    x = bands_data["distance"][sl]
+    cols = {Spin.up: OVERLAY_UP_BACKBONE, Spin.down: OVERLAY_DOWN_BACKBONE}
+    for sp in (Spin.up, Spin.down):
+        bands = bands_data["bands"].get(sp)
+        if bands is None:
+            continue
+        for band in bands:
+            ax.plot(x, band[sl], color=cols[sp], lw=OVERLAY_BACKBONE_LW,
+                    ls=OVERLAY_BACKBONE_LS, alpha=OVERLAY_BACKBONE_ALPHA,
+                    zorder=1, solid_capstyle="round")
+
+
 # --------------------------------------------------------------------------- #
 # Method dispatch
 # --------------------------------------------------------------------------- #
 def _draw_segment(ax, bands_data, groups, band_w, w_tot, sl, spins, cfg, lsty,
-                  show_both, spacing):
-    """Dispatch one k-path sub-panel to the chosen projection method."""
+                  spacing):
+    """Dispatch one k-path sub-panel to the chosen projection method (a single
+    spin channel; --spin both is handled as separate figures + the overlay)."""
     method = getattr(cfg, "method", DEFAULT_METHOD)
     if method == "plain":
-        _draw_plain(ax, bands_data, sl, spins, cfg, lsty, show_both)
+        _draw_plain(ax, bands_data, sl, spins, cfg, lsty)
     elif method == "stacked":
         _draw_stacked(ax, bands_data, groups, band_w, w_tot, sl, spins, cfg, lsty)
-    else:                                # rgb (3), duo (2), one_orbital (1)
+    else:                                # rgb (3), duo (2), one_orbital (1), cmyk (4)
         if method == "one_orbital":
-            channels = ONE_ORBITAL_CHANNEL
+            channels, color_fn = ONE_ORBITAL_CHANNEL, _hybrid_colors
         elif method == "duo":
-            channels = DUO_CHANNELS
+            channels, color_fn = DUO_CHANNELS, _hybrid_colors
+        elif method == "cmyk":
+            channels, color_fn = CMYK_CHANNELS, _cmyk_colors
         else:
-            channels = RGB_CHANNELS
+            channels, color_fn = RGB_CHANNELS, _hybrid_colors
         _draw_alpha_circles(ax, bands_data, groups, band_w, w_tot, sl, spins, cfg,
-                            lsty, show_both, spacing, channels)
+                            lsty, spacing, channels, color_fn)
 
 
-def _draw_plain(ax, bands_data, sl, spins, cfg, lsty, show_both):
-    """plain method: shared pale backbone + a small black marker (intermediate
-    opacity) at every k-point where the eigenvalues were computed. One spin ->
-    circles; both spins -> up/down triangles with cyan/magenta edges."""
+def _draw_plain(ax, bands_data, sl, spins, cfg, lsty):
+    """plain method: shared pale backbone + a small, slightly-translucent black
+    circle at every k-point where the eigenvalues were computed."""
     _draw_backbone(ax, bands_data, sl, spins, lsty)
     x = bands_data["distance"][sl]
     size = float(getattr(cfg, "plain_marker_size", PLAIN_MARKER_SIZE))
@@ -123,22 +151,36 @@ def _draw_plain(ax, bands_data, sl, spins, cfg, lsty, show_both):
     for sp in spins:
         Y = bands_data["bands"][sp][:, sl]               # (nb, nk_seg)
         X = np.tile(x, Y.shape[0])
-        Yf = Y.reshape(-1)
-        marker = _spin_marker(sp, show_both)
-        if show_both:                                    # triangles + spin edge
-            ax.scatter(X, Yf, s=size, marker=marker, facecolors=[face],
-                       edgecolors=_spin_edge(sp), linewidths=SPIN_EDGE_LW,
-                       zorder=3 if sp == Spin.up else 4)
-        else:                                            # single channel: circle
-            ax.scatter(X, Yf, s=size, marker=marker, facecolors=[face],
-                       edgecolors="none", linewidths=0.0, zorder=3)
+        ax.scatter(X, Y.reshape(-1), s=size, marker=MARKER, facecolors=[face],
+                   edgecolors="none", linewidths=0.0, zorder=3)
+
+
+def _draw_overlay_plain(ax, bands_data, sl, cfg):
+    """Overlaid plain plot (ISPIN=2, --spin both): both channels in one plain
+    plot -- spin-up pure-RGB-blue, spin-down vivid-orange, slightly-translucent
+    circles over two dashed, pale, per-spin backbones. No projections."""
+    _draw_overlay_backbones(ax, bands_data, sl)
+    x = bands_data["distance"][sl]
+    size = float(getattr(cfg, "plain_marker_size", PLAIN_MARKER_SIZE))
+    cols = {Spin.up: OVERLAY_UP_COLOR, Spin.down: OVERLAY_DOWN_COLOR}
+    for sp in (Spin.up, Spin.down):
+        bands = bands_data["bands"].get(sp)
+        if bands is None:
+            continue
+        Y = bands[:, sl]
+        X = np.tile(x, Y.shape[0])
+        face = mcolors.to_rgba(cols[sp], PLAIN_ALPHA)
+        ax.scatter(X, Y.reshape(-1), s=size, marker=MARKER, facecolors=[face],
+                   edgecolors="none", linewidths=0.0,
+                   zorder=3 if sp == Spin.up else 4)
 
 
 def _draw_alpha_circles(ax, bands_data, groups, band_w, w_tot, sl, spins, cfg,
-                        lsty, show_both, spacing, channels):
-    """rgb / duo / one_orbital: shared backbone + one fixed-size circle per
-    (band, k). Colour = relative mix of `channels` (additive for >=2, pure blue
-    for one_orbital); OPACITY = S = (sum group weights)/w_tot."""
+                        lsty, spacing, channels, color_fn=_hybrid_colors):
+    """rgb / duo / one_orbital / cmyk: shared backbone + one fixed-size circle
+    per (band, k). Colour = `color_fn` of the relative group weights (additive
+    for rgb/duo/one_orbital, subtractive CMYK for cmyk); OPACITY = S = (sum of
+    the selected group weights)/w_tot. Always plain circles (no spin edges)."""
     ng = len(channels)
     _draw_backbone(ax, bands_data, sl, spins, lsty)
     x = bands_data["distance"][sl]
@@ -175,23 +217,23 @@ def _draw_alpha_circles(ax, bands_data, groups, band_w, w_tot, sl, spins, cfg,
             continue
         X, Y, W, S = X[keep], Y[keep], W[keep], S[keep]
 
-        rgb = _hybrid_colors(W, channels)            # colour from relative mix
+        rgb = color_fn(W, channels)                  # colour from relative mix
         alpha = al_lo + (al_hi - al_lo) * S          # opacity = total weight
         rgba = np.concatenate([rgb, alpha[:, None]], axis=1)      # (M,4)
 
-        marker = _spin_marker(sp, show_both)
-        if show_both:                                # triangles + cyan/magenta edge
-            ax.scatter(X, Y, s=size, marker=marker, facecolors=rgba,
-                       edgecolors=_spin_edge(sp), linewidths=SPIN_EDGE_LW,
-                       zorder=3 if sp == Spin.up else 4)
-        else:                                        # single channel: filled circle
-            ax.scatter(X, Y, s=size, marker=marker, facecolors=rgba,
-                       edgecolors="none", linewidths=0.0, zorder=3)
+        ax.scatter(X, Y, s=size, marker=MARKER, facecolors=rgba,
+                   edgecolors="none", linewidths=0.0, zorder=3)
 
 
 def _draw_stacked(ax, bands_data, groups, band_w, w_tot, sl, spins, cfg, lsty):
-    """sumo's "stacked" projected-band mode (area = circle_size * w**2), now with
-    the shared pale backbone drawn behind the circles for visual consistency."""
+    """sumo's "stacked" projected-band mode, faithfully reproduced: per (band, k)
+    the projection weights are NORMALISED (sumo `normalise`, default "select" =
+    by the sum over the selected groups), the bands + weights are spline-
+    interpolated by `interpolate_factor` for smoothness, weights below
+    `projection_cutoff` are zeroed, and each group is drawn as filled circles of
+    AREA = circle_size * w**2 in the sumo colour cycle (edgeless, rasterised),
+    later groups behind earlier ones (zorder). The shared pale backbone is kept
+    behind the circles."""
     _draw_backbone(ax, bands_data, sl, spins, lsty)
     circle_size = float(getattr(cfg, "circle_size", STACKED_CIRCLE_SIZE))
     cutoff = STACKED_PROJ_CUTOFF
@@ -201,19 +243,29 @@ def _draw_stacked(ax, bands_data, groups, band_w, w_tot, sl, spins, cfg, lsty):
 
     for sp in spins:
         bands = bands_data["bands"][sp][:, sl]                    # (nb, nk)
-        weights = []
+        raw = []
         for g in groups:
             w = band_w[g["plain"]]
             wg = (w[sp][:, sl] if (w is not None and sp in w)
                   else np.zeros_like(bands))
-            if w_tot is not None and sp in w_tot:
-                tot = w_tot[sp][:, sl]
-                wg = np.divide(wg, tot, out=np.zeros_like(wg), where=tot > 0)
-            weights.append(np.clip(wg, 0.0, None))
-        weights = np.array(weights)                               # (ng, nb, nk)
-        distances = x
+            raw.append(np.clip(wg, 0.0, None))
+        raw = np.array(raw)                                       # (ng, nb, nk)
 
-        if len(distances) > 2:                       # sumo: interpolate for smoothness
+        # sumo normalisation of the per-point projection weights
+        if STACKED_NORMALISE == "select":
+            denom = raw.sum(axis=0)                               # sum of selected
+        elif STACKED_NORMALISE == "all" and w_tot is not None and sp in w_tot:
+            denom = w_tot[sp][:, sl]                              # all states
+        else:
+            denom = None                                         # raw magnitudes
+        if denom is not None:
+            weights = np.divide(raw, denom, out=np.zeros_like(raw),
+                                where=denom > 0)
+        else:
+            weights = raw
+
+        distances = x
+        if len(distances) > 2:                       # sumo interpolate_factor
             td = np.linspace(distances[0], distances[-1],
                              len(distances) * STACKED_INTERP)
             bands = interp1d(distances, bands, axis=1, bounds_error=False,
@@ -221,10 +273,6 @@ def _draw_stacked(ax, bands_data, groups, band_w, w_tot, sl, spins, cfg, lsty):
             weights = interp1d(distances, weights, axis=2, bounds_error=False,
                                fill_value="extrapolate")(td)
             distances = td
-        else:
-            weights = np.array(weights)
-            bands = np.array(bands)
-            distances = np.array(distances)
 
         weights[weights < 0] = 0
         weights[weights < cutoff] = 0
@@ -234,7 +282,7 @@ def _draw_stacked(ax, bands_data, groups, band_w, w_tot, sl, spins, cfg, lsty):
         zorders = range(-len(weights), 0)
         for w, c, z in zip(weights, colours, zorders):
             ax.scatter(dd, bb, c=c, s=circle_size * w.flatten() ** 2,
-                       zorder=z, rasterized=True)
+                       lw=0, edgecolors="none", zorder=z, rasterized=True)
 
 
 def _abs_fmt(v, _pos):
@@ -294,6 +342,7 @@ def _annotate_gap(band_axes, segs, dist, gap):
 
 
 def _apply_rcparams(font):
+    """Set the shared matplotlib rcParams (fonts, ticks, legend) for every figure."""
     plt.rcParams.update({
         "font.family": "serif",
         "font.serif": ["Times New Roman", "Times", "Nimbus Roman",
@@ -308,20 +357,28 @@ def _apply_rcparams(font):
 
 
 def build_figure(bands_data, dos_data, groups, cfg, spins, show_both, gap=None,
-                 spin_note=None):
+                 spin_note=None, overlay_plain=False):
     """Assemble the figure. Returns (fig, {'bands': [axes...], 'dos': axes}).
 
-    `spin_note` (e.g. r"\\uparrow") is appended to the title -- used when the
-    stacked method is split into one figure per spin channel.
+    Every normal figure now draws a SINGLE spin channel (no in-figure overlay of
+    the two channels). `overlay_plain=True` is the one exception: the dedicated
+    two-colour plain plot for --spin both, with spin-up bands in blue and
+    spin-down in orange (plus a mirrored, blue/orange total DOS).
+
+    `spin_note` (e.g. r"\\uparrow") is appended to the title.
     """
-    ls_for = {Spin.up: "solid", Spin.down: (0, (4, 2))}
-    method = getattr(cfg, "method", DEFAULT_METHOD)
+    method = "plain" if overlay_plain else getattr(cfg, "method", DEFAULT_METHOD)
+    # show_both mirrors the DOS (up positive, down negative); it is only ever
+    # True for the overlaid plain plot now.
+    show_both = bool(show_both or overlay_plain)
 
     def sign(sp):
         return -1.0 if (show_both and sp == Spin.down) else 1.0
 
     def lsty(sp):
-        return ls_for[sp] if show_both else "solid"
+        return "solid"                               # single-spin lines are solid
+
+    overlay_cols = {Spin.up: OVERLAY_UP_COLOR, Spin.down: OVERLAY_DOWN_COLOR}
 
     _apply_rcparams(cfg.font)
 
@@ -359,8 +416,11 @@ def build_figure(bands_data, dos_data, groups, cfg, spins, show_both, gap=None,
 
     # ---- LEFT: one sub-panel per continuous k-path segment ----
     for j, (ax, sl) in enumerate(zip(band_axes, segs)):
-        _draw_segment(ax, bands_data, groups, band_w, w_tot, sl, spins, cfg,
-                      lsty, show_both, spacing)
+        if overlay_plain:
+            _draw_overlay_plain(ax, bands_data, sl, cfg)
+        else:
+            _draw_segment(ax, bands_data, groups, band_w, w_tot, sl, spins, cfg,
+                          lsty, spacing)
         ax.axhline(0.0, **ef_kw)
         xs = dist[sl]
         ax.set_xlim(xs[0], xs[-1])
@@ -390,15 +450,21 @@ def build_figure(bands_data, dos_data, groups, cfg, spins, show_both, gap=None,
         return _smear(E, arr, cfg.smear)[mask]
 
     xmax = 0.0
-    for sp in spins:
+    dos_spins = [Spin.up, Spin.down] if overlay_plain else spins
+    for sp in dos_spins:
         tot = dos_data["total"].get(sp)
         if tot is None:
             continue
         y = sign(sp) * prep(tot)
-        axd.fill_betweenx(Em, 0.0, y, color="0.86", lw=0, zorder=1)
-        axd.plot(y, Em, color="0.55", lw=DOS_TOTAL_LW, zorder=2)
+        if overlay_plain:                            # blue (up) / orange (down)
+            axd.fill_betweenx(Em, 0.0, y, color=overlay_cols[sp], alpha=0.16,
+                              lw=0, zorder=1)
+            axd.plot(y, Em, color=overlay_cols[sp], lw=DOS_TOTAL_LW, zorder=2)
+        else:
+            axd.fill_betweenx(Em, 0.0, y, color="0.86", lw=0, zorder=1)
+            axd.plot(y, Em, color="0.55", lw=DOS_TOTAL_LW, zorder=2)
         xmax = max(xmax, np.abs(y).max() if y.size else 0.0)
-    for g in groups:
+    for g in ([] if overlay_plain else groups):       # overlay plain: no projections
         pj = proj_dos[g["plain"]]
         if pj is None:
             continue
@@ -433,27 +499,25 @@ def build_figure(bands_data, dos_data, groups, cfg, spins, show_both, gap=None,
                       markerfacecolor=color, markeredgecolor="none",
                       markersize=8, label=label)
 
-    handles = [Line2D([0], [0], color="0.55", lw=2.0, label="total")]
-    if method == "plain":
-        handles.append(Line2D([0], [0], color="none", marker=legend_marker,
-                              markerfacecolor=PLAIN_MARKER_COLOR,
-                              markeredgecolor="none", markersize=7,
-                              label="k-points"))
-    for g in groups:                                  # each group in its colour
-        handles.append(group_handle(g["color"], g["label"]))
-    marker_methods = method not in ("stacked",)       # spin marks (not stacked)
-    if show_both and marker_methods:                   # up/down triangles + edges
-        handles += [
-            Line2D([0], [0], color="none", marker=SPIN_UP_MARKER,
-                   markerfacecolor="0.6", markeredgecolor=SPIN_UP_EDGE,
-                   markeredgewidth=1.0, markersize=8, label=r"spin $\uparrow$"),
-            Line2D([0], [0], color="none", marker=SPIN_DOWN_MARKER,
-                   markerfacecolor="0.6", markeredgecolor=SPIN_DOWN_EDGE,
-                   markeredgewidth=1.0, markersize=8, label=r"spin $\downarrow$"),
+    if overlay_plain:                                 # two-colour plain overlay
+        handles = [
+            group_handle(OVERLAY_UP_COLOR, r"spin $\uparrow$"),
+            group_handle(OVERLAY_DOWN_COLOR, r"spin $\downarrow$"),
         ]
-    elif bands_data["is_spin"] and marker_methods:
-        arrow = r"\uparrow" if spins == [Spin.up] else r"\downarrow"
-        handles.append(Line2D([0], [0], color="none", label=r"spin $%s$" % arrow))
+    else:
+        handles = [Line2D([0], [0], color="0.55", lw=2.0, label="total")]
+        if method == "plain":
+            handles.append(Line2D([0], [0], color="none", marker=legend_marker,
+                                  markerfacecolor=PLAIN_MARKER_COLOR,
+                                  markeredgecolor="none", markersize=7,
+                                  label="k-points"))
+        for g in groups:                              # each group in its colour
+            handles.append(group_handle(g["color"], g["label"]))
+        # single-spin figure: note which channel is shown (ISPIN=2 only)
+        if bands_data["is_spin"] and method != "stacked":
+            arrow = r"\uparrow" if spins == [Spin.up] else r"\downarrow"
+            handles.append(Line2D([0], [0], color="none",
+                                  label=r"spin $%s$" % arrow))
     axd.legend(handles=handles, loc="upper right", borderaxespad=0.4,
                handlelength=1.6, labelspacing=0.3)
 

@@ -23,7 +23,7 @@ USAGE
 OUTPUT
     Prints one line:  U = X.XXX eV
 
-WORKFLOW  (4-step Cococcioni linear-response U on NLHPC)
+WORKFLOW  (4-step Cococcioni linear-response U on a SLURM cluster)
     Step 1:  run_nscf_steps.sh  --  submit NSCF perturbation jobs
     Step 2:  run_scf_steps.sh   --  submit SCF response jobs
     Step 3:  collect_u_data.sh  --  gather d/f-occupations into U_data.dat

@@ -2,16 +2,18 @@
 ###############################################################################
 # vasp_quick_plots.sh   (invoked on PATH as: vasp-quick-plots)
 #
-# One fat-band/DOS figure per plotting method, in a single command. For each
-# method the most-important projections over the energy window are chosen
-# automatically (by vasp-plot-fatbandsdos --auto-projections), so you get a
-# quick, faithful overview without hand-picking orbitals:
+# One fat-band/DOS figure per plotting method, in a single command, organised
+# into numbered sub-folders under <root>/Plots/. For each method the most-
+# important projections over the energy window are chosen automatically (by
+# vasp-plot-fatbandsdos --auto-projections), so you get a quick, faithful
+# overview without hand-picking orbitals:
 #
-#   plain        no projection: pale-grey backbone + black k-point dots
-#   one_orbital  the single most-contributing (element, dominant-l), e.g. Cu-d
-#   duo          the 2 most-contributing elements (e.g. Cu-d, S-p)
-#   rgb          the 3 most-contributing elements
-#   stacked      the N most-contributing elements (default 4)
+#   0_Plain     no projection: pale-grey backbone + black k-point dots
+#   1_ONE       one_orbital: the single most-contributing (element, dominant-l)
+#   2_DUO       duo: the 2 most-contributing units
+#   3_RGB       rgb: the 3 most-contributing units (red/green/blue)
+#   4_CMYK      cmyk: the 4 most-contributing units (cyan/magenta/yellow/black)
+#   5_Stacked   stacked: the 5 most-contributing units (sumo-style circles)
 #
 # "Most-contributing" is measured by the projected DOS integrated over the
 # energy window [--emin, --emax] (a proper states integral, summed over spin).
@@ -19,17 +21,21 @@
 # back to inequivalent Wyckoff sites of the same element (Pt1-d, Pt2-d, ...),
 # always in descending order of contribution.
 #
-# OUTPUT (under <root>/Plots/):
-#   plain.{png,pdf}  one_orbital.{png,pdf}  duo.{png,pdf}
-#   rgb.{png,pdf}    stacked.{png,pdf}      (+ <name>.analysis_report.txt each)
+# SPIN (ISPIN=2):
+#   --spin both  -> EVERY folder gets separate spin-up and spin-down plots
+#                   (e.g. rgb_up, rgb_down). The 0_Plain folder ALSO gets the
+#                   overlaid blue/orange plain plot (rgb-blue = up, orange = down).
+#   --spin up    -> every folder gets only the spin-up plot.
+#   --spin down  -> every folder gets only the spin-down plot.
+#   (ISPIN=1 calculations ignore --spin and write a single plot per folder.)
 #
 # USAGE
 #   conda activate wolfpack-dft         # needs pymatgen/numpy/matplotlib/scipy
 #   cd <root with Scf/ Bands/ Dos/>
 #   vasp-quick-plots                    # all methods, auto energy window
 #   vasp-quick-plots --emin -6 --emax 6 --title "CuVS_3"
-#   vasp-quick-plots --methods plain,one_orbital,rgb
-#   vasp-quick-plots --root path/to/calc --stacked-n 5 --spin both
+#   vasp-quick-plots --methods plain,rgb,cmyk
+#   vasp-quick-plots --root path/to/calc --stacked-n 6 --spin both
 #   vasp-quick-plots --help
 #
 # OPTIONS
@@ -37,9 +43,9 @@
 #   --emin/--emax EV  energy window (rel. E_F) for BOTH the view and the
 #                     contribution ranking (default: auto-fit to the bands)
 #   --title STR       figure title (TeX-ish, e.g. "CuVS_3 - G_0W_0")
-#   --methods LIST    comma list from: plain,one_orbital,duo,rgb,stacked
-#                     (default: all five)
-#   --stacked-n N     how many units for the stacked plot (default: 4)
+#   --methods LIST    comma list from: plain,one_orbital,duo,rgb,cmyk,stacked
+#                     (default: all six)
+#   --stacked-n N     how many units for the stacked plot (default: 5)
 #   --spin {both,up,down}   spin channel(s) (default: both)
 #   --formats LIST    output formats, e.g. png,pdf (default: png,pdf)
 #   --group MODE      site grouping symmetry|formula|element (default: symmetry)
@@ -48,7 +54,7 @@
 set -uo pipefail
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    sed -n '2,46p' "${BASH_SOURCE[0]}" | grep -v '^#####' | sed 's/^# \{0,1\}//'
+    sed -n '2,57p' "${BASH_SOURCE[0]}" | grep -v '^#####' | sed 's/^# \{0,1\}//'
     exit 0
 fi
 
@@ -62,8 +68,8 @@ warn() { printf '%s\n' "    ${c_yel}WARN${c_rst} $*" >&2; }
 # --------------------------------------------------------------------------- #
 ROOT="."
 EMIN=""; EMAX=""; TITLE=""
-METHODS="plain,one_orbital,duo,rgb,stacked"
-STACKED_N=4
+METHODS="plain,one_orbital,duo,rgb,cmyk,stacked"
+STACKED_N=5
 SPIN="both"
 FORMATS="png,pdf"
 GROUP="symmetry"
@@ -122,18 +128,21 @@ COMMON=(--root "$ROOT" --spin "$SPIN" --formats "$FORMATS" --group "$GROUP")
 [[ -n "$TITLE" ]] && COMMON+=(--title "$TITLE")
 [[ ${#EXTRA[@]} -gt 0 ]] && COMMON+=("${EXTRA[@]}")
 
-# Units auto-picked per method (plain takes none).
-declare -A NUNITS=( [plain]=0 [one_orbital]=1 [duo]=2 [rgb]=3 [stacked]="$STACKED_N" )
+# method -> (units auto-picked, numbered output sub-folder). plain takes none.
+declare -A NUNITS=( [plain]=0 [one_orbital]=1 [duo]=2 [rgb]=3 [cmyk]=4 [stacked]="$STACKED_N" )
+declare -A SUBDIR=( [plain]=0_Plain [one_orbital]=1_ONE [duo]=2_DUO \
+                    [rgb]=3_RGB [cmyk]=4_CMYK [stacked]=5_Stacked )
 
 info "WolfPack-DFT quick plots"
 echo "    root    : $ROOT"
 echo "    window  : ${EMIN:-auto} .. ${EMAX:-auto} eV   (selection + view)"
 echo "    methods : $METHODS"
+echo "    spin    : $SPIN"
 echo "    plotter : ${PLOT_CMD[*]}"
 echo
 
 # --------------------------------------------------------------------------- #
-# One plot per requested method
+# One plot (set) per requested method, into its numbered sub-folder
 # --------------------------------------------------------------------------- #
 n_ok=0; n_fail=0
 IFS=',' read -r -a METHOD_LIST <<< "$METHODS"
@@ -144,14 +153,15 @@ for raw in "${METHOD_LIST[@]}"; do
         warn "unknown method '$raw' — skipping (valid: ${!NUNITS[*]})."
         continue
     fi
-    args=("${COMMON[@]}" --method "$m" --name "$m")
-    if [[ "${NUNITS[$m]}" -gt 0 ]]; then
-        args+=(--auto-projections "${NUNITS[$m]}")
-    fi
+    args=("${COMMON[@]}" --method "$m" --subdir "${SUBDIR[$m]}" --name "$m")
+    [[ "${NUNITS[$m]}" -gt 0 ]] && args+=(--auto-projections "${NUNITS[$m]}")
+    # The overlaid blue/orange plain plot (for --spin both) belongs ONLY in
+    # 0_Plain, so suppress it for every other method.
+    [[ "$m" != "plain" ]] && args+=(--no-overlay-plain)
 
-    info "[$m] ${PLOT_CMD[*]##*/} --method $m $([[ ${NUNITS[$m]} -gt 0 ]] && echo "--auto-projections ${NUNITS[$m]}")"
+    info "[$m] -> Plots/${SUBDIR[$m]}/"
     if "${PLOT_CMD[@]}" "${args[@]}"; then
-        ok "$ROOT/Plots/$m.{${FORMATS}}"
+        ok "$ROOT/Plots/${SUBDIR[$m]}/"
         n_ok=$((n_ok + 1))
     else
         warn "$m plot failed (see message above) — continuing with the rest."
@@ -164,7 +174,7 @@ done
 # Summary
 # --------------------------------------------------------------------------- #
 info "Quick plots finished: ${c_grn}$n_ok ok${c_rst}, $([[ $n_fail -gt 0 ]] && echo "${c_red}$n_fail failed${c_rst}" || echo "0 failed")."
-echo "    figures in: $ROOT/Plots/"
+echo "    figures in: $ROOT/Plots/{0_Plain,1_ONE,2_DUO,3_RGB,4_CMYK,5_Stacked}/"
 if [[ $n_fail -gt 0 ]]; then
     echo "    Tip: if everything failed with a ModuleNotFoundError, activate the env:"
     echo "         conda activate wolfpack-dft"

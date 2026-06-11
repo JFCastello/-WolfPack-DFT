@@ -16,9 +16,9 @@ from collections import OrderedDict, defaultdict
 import matplotlib
 from pymatgen.core.periodic_table import Element
 
-from .config import (DUO_CHANNELS, GROUP_MODE, ONE_ORBITAL_CHANNEL,
+from .config import (CMYK_CHANNELS, DUO_CHANNELS, ONE_ORBITAL_CHANNEL,
                      RGB_CHANNELS, STACKED_COLORS, SYMPREC)
-from .formatting import _GROUP_TOKENS, _orb_tex, _validate_orbital
+from .formatting import _orb_tex, _validate_orbital
 
 
 # --------------------------------------------------------------------------- #
@@ -110,9 +110,10 @@ def _site_grouping(structure, mode="symmetry", symprec=SYMPREC):
         labels, order, n_sites, wyk = {}, OrderedDict(), {}, {}
         for el, orbs in by_el.items():
             orbs.sort(key=lambda o: o["indices"][0])
-            n_sites[el] = len(orbs)
+            n = len(orbs)
+            n_sites[el] = n
             for k, orb in enumerate(orbs, 1):
-                tok = f"{el}{k}"
+                tok = el if n == 1 else f"{el}{k}"   # single site -> bare "Cu"
                 order[tok] = list(orb["indices"])
                 wyk[tok] = orb["wyckoff"]
                 for ai in orb["indices"]:
@@ -130,7 +131,7 @@ def _site_grouping(structure, mode="symmetry", symprec=SYMPREC):
             ns = len(idxs) // z
             n_sites[el] = ns
             for k in range(1, ns + 1):
-                tok = f"{el}{k}"
+                tok = el if ns == 1 else f"{el}{k}"   # single block -> bare "Cu"
                 blk = list(idxs[(k - 1) * z:k * z])
                 order[tok] = blk
                 for ai in blk:
@@ -141,9 +142,10 @@ def _site_grouping(structure, mode="symmetry", symprec=SYMPREC):
     # element mode
     labels, order, n_sites = {}, OrderedDict(), {}
     for el, idxs in sps.items():
-        n_sites[el] = len(idxs)
+        n = len(idxs)
+        n_sites[el] = n
         for k, ai in enumerate(idxs, 1):
-            tok = f"{el}{k}"
+            tok = el if n == 1 else f"{el}{k}"       # single atom -> bare "Cu"
             order[tok] = [ai]
             labels[ai] = tok
     return dict(mode="element", labels=labels, order=order,
@@ -202,19 +204,18 @@ def parse_projection_spec(spec, structure, n_orb, grouping):
                 f'Atom of species "{el_raw}" was not found in the calculation'
                 f'{extra}. Species present: {avail}.')
 
-        if idx:
+        ns = grouping["n_sites"].get(el, 0)
+        if idx and not (ns <= 1):                    # specific site of a multi-site element
             tok = f"{el}{idx}"
             if tok not in order:
-                ns = grouping["n_sites"].get(el, 0)
-                rng = f"{el}1" if ns <= 1 else f"{el}1..{el}{ns}"
                 raise ValueError(
                     f'Requested {tok}, but {_grouping_hint(grouping, el)} — use '
-                    f'{rng}, or a bare "{el}" to sum all {len(sps[el])} {el} '
-                    f'atoms. Run --list to inspect the site grouping.')
+                    f'{el}1..{el}{ns}, or a bare "{el}" to sum all '
+                    f'{len(sps[el])} {el} atoms. Run --list.')
             sites = list(order[tok])
             site_lbl = r"\mathrm{%s}_{%s}" % (el, idx)
             plain = tok
-        else:
+        else:                                        # bare element, or El1 of a single-site element
             sites = list(sps[el])
             site_lbl = r"\mathrm{%s}" % el
             plain = el
@@ -256,6 +257,7 @@ def assign_channels(groups, method):
       one_orbital : exactly 1 group -> pure blue.
       duo         : exactly 2 groups -> two opposite colours.
       rgb         : 1-3 groups -> red, green, blue (>3 rejected; <3 warns).
+      cmyk        : exactly 4 groups -> cyan, magenta, yellow, black.
       stacked     : any number of groups -> sumo's colour cycle.
     """
     n = len(groups)
@@ -294,6 +296,17 @@ def assign_channels(groups, method):
         names = ["A", "B"]
         for i, g in enumerate(groups):
             g["channel"], g["channel_name"], g["color"] = i, names[i], DUO_CHANNELS[i]
+    elif method == "cmyk":
+        if n != 4:
+            raise ValueError(
+                f"--method cmyk needs exactly 4 groups (one each for cyan, "
+                f"magenta, yellow and black), but {n} were given. Pick four "
+                f'(atom, orbital) groups, e.g. --projections '
+                f'"(Cu-d),(V-d),(S-p),(O-p)", use --auto-projections 4, or '
+                f"--method stacked for any number.")
+        names = ["cyan", "magenta", "yellow", "black"]
+        for i, g in enumerate(groups):
+            g["channel"], g["channel_name"], g["color"] = i, names[i], CMYK_CHANNELS[i]
     elif method == "stacked":
         if n < 1:
             raise ValueError("--method stacked needs at least one group.")
