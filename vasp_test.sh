@@ -20,8 +20,9 @@
 #   and benchmarks THAT EXACT config -- not your raw INCAR. Because the recommended
 #   rank count (e.g. 120) will not fit on the debug partition, it runs the same
 #   KPAR/NCORE at the largest rank count that DOES fit (up to both debug nodes,
-#   96 cores), at the maximum debug memory (node RAM minus a 16 GB reserve), for
-#   30 minutes. When the budget is up it:
+#   96 cores), at the maximum debug memory (node RAM minus a 16 GB reserve),
+#   inside a 30-min debug allocation (VASP runs a few minutes less so the
+#   analysis fits in the same job). When the budget is up it:
 #
 #     1. Reads the SLURM metrics (MaxRSS, CPU efficiency) of the FIXED config.
 #     2. SCALES the measured per-rank memory from the test rank count up to the
@@ -40,7 +41,9 @@
 #                                    # then scales + updates slurm.sh + report.out
 #
 #   Tunables (export before running):
-#     VASP_TEST_MINUTES=30          # length of the timed run (needs debug walltime)
+#     VASP_TEST_MINUTES=30          # SLURM job walltime (must be <= your debug cap);
+#                                   #   VASP itself runs ANALYSIS_MARGIN_MIN less
+#     VASP_TEST_ANALYSIS_MARGIN_MIN=4  # minutes kept inside the job for analysis
 #     VASP_TEST_MAX_CORES=96        # cap on debug ranks (default: 2 x cores/node)
 #     VASP_EXE=vasp_std             # vasp_std | vasp_gam | vasp_ncl
 #     VASP_TEST_MEM_UTIL=0.80       # request memory so usage >= this fraction
@@ -55,7 +58,7 @@
 # --- Allow `vasp-test --help` to work outside of SLURM (handled in the parser
 #     below too; this early check keeps --help working before set -u) ---------
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-    sed -n '2,52p' "${BASH_SOURCE[0]}" | grep -v '^#####' | sed 's/^# \{0,1\}//'
+    sed -n '2,55p' "${BASH_SOURCE[0]}" | grep -v '^#####' | sed 's/^# \{0,1\}//'
     exit 0
 fi
 
@@ -77,12 +80,17 @@ _wp_conf="${WOLFPACK_CLUSTER_CONF:-$HOME/.config/wolfpack-dft/cluster.conf}"
 # shellcheck source=/dev/null
 [[ -f "$_wp_conf" ]] && source "$_wp_conf"
 
-TEST_MINUTES="${VASP_TEST_MINUTES:-30}"
-DEBUG_MARGIN_MB="${VASP_TEST_DEBUG_MARGIN_MB:-16384}"   # keep free on debug node
+TEST_MINUTES="${VASP_TEST_MINUTES:-30}"                # SLURM allocation (job walltime)
+DEBUG_MARGIN_MB="${VASP_TEST_DEBUG_MARGIN_MB:-16384}"  # keep free on debug node
+# The SLURM walltime IS TEST_MINUTES (debug partitions cap it hard, e.g. 30 min).
+# VASP is run for a few minutes LESS so the in-job analysis (sacct + the scaling
+# step that updates slurm.sh) still finishes inside the same allocation.
+ANALYSIS_MARGIN_MIN="${VASP_TEST_ANALYSIS_MARGIN_MIN:-4}"
+RUN_MINUTES=$(( TEST_MINUTES - ANALYSIS_MARGIN_MIN )); (( RUN_MINUTES < 1 )) && RUN_MINUTES=1
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -h|--help) sed -n '2,52p' "${BASH_SOURCE[0]}" | grep -v '^#####' | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,55p' "${BASH_SOURCE[0]}" | grep -v '^#####' | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "vasp-test: unknown option '$1' (try --help)" >&2; shift ;;
     esac
 done
@@ -139,7 +147,7 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     tntpn=$(( (tr + tnodes - 1) / tnodes ))
     usable=$(( memnode - DEBUG_MARGIN_MB )); (( usable < 1 )) && usable=$memnode
     mempc=$(( usable / tntpn )); (( mempc < 100 )) && mempc=100
-    wmin=$(( TEST_MINUTES + 8 )); ttime=$(printf '%02d:%02d:00' $((wmin/60)) $((wmin%60)))
+    ttime=$(printf '%02d:%02d:00' $((TEST_MINUTES/60)) $((TEST_MINUTES%60)))
     self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
     mkdir -p .wolfpack
     job="$PWD/slurm_vasptest.sh"
@@ -173,7 +181,7 @@ if [[ -z "${SLURM_JOB_ID:-}" ]]; then
     chmod +x "$job"
     echo "STAGE 3: benchmarking the FIXED config (KPAR=${FIX_KPAR} NCORE=${FIX_NCORE} NSIM=${FIX_NSIM})" >&2
     echo "         at ${tr} ranks on '${part}' (${tnodes} node(s) x ${tntpn}, ${mempc} MB/cpu," >&2
-    echo "         ${DEBUG_MARGIN_MB} MB/node reserved, ${TEST_MINUTES} min); production target ${PROD_RANKS} ranks." >&2
+    echo "         ${DEBUG_MARGIN_MB} MB/node reserved, ${TEST_MINUTES}-min job / ${RUN_MINUTES}-min VASP run); production target ${PROD_RANKS} ranks." >&2
     exec sbatch "$job"
 fi
 
@@ -224,7 +232,7 @@ TEST_NPAR=$(( NTASKS / (FIX_KPAR * FIX_NCORE) )); (( TEST_NPAR < 1 )) && TEST_NP
     echo "LCHARG = .FALSE."
 } >> INCAR
 
-hdr "VASP RESOURCE BENCHMARK  (${PARTITION}, ${NTASKS} ranks, ${TEST_MINUTES} min)"
+hdr "VASP RESOURCE BENCHMARK  (${PARTITION}, ${NTASKS} ranks, ${RUN_MINUTES} min)"
 echo "  job id        : $SLURM_JOB_ID"
 echo "  run directory : $RUNDIR"
 echo "  executable    : $VASP_EXE"
@@ -261,18 +269,19 @@ if [[ -n "${WP_EXTRA_ENV:-}" ]]; then
 fi
 
 # --------------------------------------------------------------------------- #
-# 3. Run VASP for at most TEST_MINUTES, then stop it
+# 3. Run VASP for at most RUN_MINUTES (< the SLURM allocation), then stop it so
+#    the analysis below still finishes inside the requested walltime.
 # --------------------------------------------------------------------------- #
 hdr "RUNNING VASP (timed)"
 run_start=$(date +%s)
 # --signal=TERM lets VASP exit at the next safe point; --kill-after forces it.
-timeout --signal=TERM --kill-after=30s "${TEST_MINUTES}m" \
+timeout --signal=TERM --kill-after=30s "${RUN_MINUTES}m" \
     srun --cpu-bind=cores "$VASP_EXE"
 rc=$?
 run_end=$(date +%s)
 wall=$(( run_end - run_start ))
 if [[ $rc -eq 124 || $rc -eq 137 ]]; then
-    echo "  VASP reached the ${TEST_MINUTES}-minute benchmark limit and was stopped (expected)."
+    echo "  VASP reached the ${RUN_MINUTES}-minute benchmark limit and was stopped (expected)."
 elif [[ $rc -eq 0 ]]; then
     echo "  VASP finished on its own before the limit (small system) -- metrics still valid."
 else
